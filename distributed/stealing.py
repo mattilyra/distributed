@@ -303,6 +303,9 @@ class WorkStealing(SchedulerPlugin):
             if len(idle) < 20:
                 idle = sorted(idle, key=combined_occupancy)
 
+            import pdb
+            pdb.set_trace()
+
             for level, cost_multiplier in enumerate(self.cost_multipliers):
                 if not idle:
                     break

@@ -1227,6 +1227,12 @@ class Scheduler(ServerNode):
                         self.transitions(recommendations)
 
             recommendations = {}
+
+            # if ts.resource_restrictions:
+            #     w = {resource: {w for w, supplied in self.resources[resource].items()
+            #                     if supplied >= required}
+            #          for resource, required in ts.resource_restrictions.items()}
+            resources_ = self.resources.copy()
             for ts in list(self.unrunnable):
                 valid = self.valid_workers(ts)
                 if valid is True or ws in valid:
@@ -3844,9 +3850,14 @@ class Scheduler(ServerNode):
                 s |= ss
 
         if ts.resource_restrictions:
-            w = {resource: {w for w, supplied in self.resources[resource].items()
-                            if supplied >= required}
-                 for resource, required in ts.resource_restrictions.items()}
+            # virtual accounting of resources, actual accounting will be done
+            # if and when the tasks are given to workers
+            resources = self.resources.copy()
+            w = defaultdict(set)
+            for resource, required in ts.resource_restrictions.items():
+                for ws, supplied in resources[resource].items():
+                    if supplied >= required:
+                        w[resource].add(ws)
 
             ww = set.intersection(*w.values())
 
@@ -3864,11 +3875,13 @@ class Scheduler(ServerNode):
         if ts.resource_restrictions:
             for r, required in ts.resource_restrictions.items():
                 ws.used_resources[r] += required
+                self.resources[r][ws] -= required
 
     def release_resources(self, ts, ws):
         if ts.resource_restrictions:
             for r, required in ts.resource_restrictions.items():
                 ws.used_resources[r] -= required
+                self.resources[r][ws] += required
 
     #####################
     # Utility functions #

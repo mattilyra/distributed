@@ -4,7 +4,7 @@ import logging
 
 from ..diagnostics.progress_stream import color_of
 from ..diagnostics.plugin import SchedulerPlugin
-from ..utils import key_split
+from ..utils import key_split, format_time
 
 
 logger = logging.getLogger(__name__)
@@ -20,7 +20,7 @@ class TaskStreamPlugin(SchedulerPlugin):
 
     def transition(self, key, start, finish, *args, **kwargs):
         if start == 'processing':
-            if key not in self.scheduler.task_state:
+            if key not in self.scheduler.tasks:
                 return
             kwargs['key'] = key
             if finish == 'memory' or finish == 'erred':
@@ -32,6 +32,7 @@ class TaskStreamPlugin(SchedulerPlugin):
     def rectangles(self, istart, istop=None, workers=None, start_boundary=0):
         L_start = []
         L_duration = []
+        L_duration_text = []
         L_key = []
         L_name = []
         L_color = []
@@ -65,6 +66,7 @@ class TaskStreamPlugin(SchedulerPlugin):
 
                 L_start.append((start + stop) / 2 * 1000)
                 L_duration.append(1000 * (stop - start))
+                L_duration_text.append(format_time(stop - start))
                 L_key.append(key)
                 L_name.append(prefix[action] + name)
                 L_color.append(color)
@@ -75,6 +77,7 @@ class TaskStreamPlugin(SchedulerPlugin):
 
         return {'start': L_start,
                 'duration': L_duration,
+                'duration_text': L_duration_text,
                 'key': L_key,
                 'name': L_name,
                 'color': L_color,

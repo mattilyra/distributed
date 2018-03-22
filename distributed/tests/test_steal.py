@@ -16,11 +16,17 @@ from distributed.config import config
 from distributed.metrics import time
 from distributed.scheduler import BANDWIDTH, key_split
 from distributed.utils_test import (slowinc, slowadd, inc, gen_cluster,
-                                    slowidentity)
-from distributed.utils_test import loop # flake8: noqa
+                                    slowidentity, captured_logger)
+from distributed.utils_test import (nodebug_setup_module,
+                                    nodebug_teardown_module)
 from distributed.worker import TOTAL_MEMORY
 
 import pytest
+
+
+# Most tests here are timing-dependent
+setup_module = nodebug_setup_module
+teardown_module = nodebug_teardown_module
 
 
 @pytest.mark.skipif(not sys.platform.startswith('linux'),
@@ -30,7 +36,6 @@ import pytest
 def test_work_stealing(c, s, a, b):
     [x] = yield c._scatter([1], workers=a.address)
     futures = c.map(slowadd, range(50), [x] * 50)
-    yield gen.sleep(0.1)
     yield wait(futures)
     assert len(a.data) > 10
     assert len(b.data) > 10
@@ -114,7 +119,7 @@ def test_eventually_steal_unknown_functions(c, s, a, b):
     assert len(b.data) >= 3
 
 
-@pytest.mark.xfail(reason='')
+@pytest.mark.skip(reason='')
 @gen_cluster(client=True, ncores=[('127.0.0.1', 1)] * 3)
 def test_steal_related_tasks(e, s, a, b, c):
     futures = e.map(slowinc, range(20), delay=0.05, workers=a.address,
@@ -218,7 +223,8 @@ def test_dont_steal_host_restrictions(c, s, a, b):
     yield future
 
     futures = c.map(slowinc, range(100), delay=0.1, workers='127.0.0.1')
-    yield gen.sleep(0.1)
+    while len(a.task_state) < 10:
+        yield gen.sleep(0.01)
     assert len(a.task_state) == 100
     assert len(b.task_state) == 0
 
@@ -366,7 +372,6 @@ def assert_balanced(inp, expected, c, s, *workers):
     steal._pc.stop()
 
     counter = itertools.count()
-    B = BANDWIDTH
     tasks = list(concat(inp))
     data_seq = itertools.count()
 
@@ -375,7 +380,12 @@ def assert_balanced(inp, expected, c, s, *workers):
         for t in sorted(ts, reverse=True):
             if t:
                 [dat] = yield c._scatter([next(data_seq)], workers=w.address)
-                s.nbytes[dat.key] = BANDWIDTH * t
+                ts = s.tasks[dat.key]
+                # Ensure scheduler state stays consistent
+                old_nbytes = ts.nbytes
+                ts.nbytes = BANDWIDTH * t
+                for ws in ts.who_has:
+                    ws.nbytes += ts.nbytes - old_nbytes
             else:
                 dat = 123
             s.task_duration[str(int(t))] = 1
@@ -386,7 +396,6 @@ def assert_balanced(inp, expected, c, s, *workers):
 
     while len(s.rprocessing) < len(futures):
         yield gen.sleep(0.001)
-
 
     for i in range(10):
         steal.balance()
@@ -408,7 +417,7 @@ def assert_balanced(inp, expected, c, s, *workers):
 
         if result2 == expected2:
             return
-    raise Exception()
+    raise Exception('Expected: {}; got: {}'.format(str(expected2), str(result2)))
 
 
 @pytest.mark.parametrize('inp,expected', [
@@ -472,7 +481,8 @@ def test_balance(inp, expected):
     test()
 
 
-@gen_cluster(client=True, ncores=[('127.0.0.1', 1)] * 2, Worker=Nanny)
+@gen_cluster(client=True, ncores=[('127.0.0.1', 1)] * 2, Worker=Nanny,
+             timeout=20)
 def test_restart(c, s, a, b):
     futures = c.map(slowinc, range(100), delay=0.1, workers=a.address,
                     allow_other_workers=True)
@@ -483,7 +493,7 @@ def test_restart(c, s, a, b):
     assert any(st for st in steal.stealable_all)
     assert any(x for L in steal.stealable.values() for x in L)
 
-    yield c._restart()
+    yield c.restart(timeout=10)
 
     assert not any(x for x in steal.stealable_all)
     assert not any(x for L in steal.stealable.values() for x in L)
@@ -517,17 +527,22 @@ def test_steal_twice(c, s, a, b):
 
     futures = [c.submit(slowadd, x, i, delay=0.2) for i in range(100)]
 
-    while len(s.task_state) < 100:  # tasks are all allocated
+    while len(s.tasks) < 100:  # tasks are all allocated
         yield gen.sleep(0.01)
 
-    workers = [Worker(s.ip, s.port, loop=s.loop) for _ in range(30)]
+    workers = [Worker(s.ip, s.port, loop=s.loop) for _ in range(20)]
     yield [w._start() for w in workers]  # army of new workers arrives to help
 
     yield wait(futures)
 
-    assert all(s.has_what.values())
-    assert max(map(len, s.has_what.values())) < 30
+    has_what = dict(s.has_what)  # take snapshot
+    empty_workers = [w for w, keys in has_what.items() if not len(keys)]
+    if len(empty_workers) > 2:
+        pytest.fail("Too many workers without keys (%d out of %d)"
+                    % (len(empty_workers), len(has_what)))
+    assert max(map(len, has_what.values())) < 30
 
+    yield c._close()
     yield [w._close() for w in workers]
 
 
@@ -539,7 +554,8 @@ def test_dont_steal_executing_tasks(c, s, a, b):
     while not a.executing:
         yield gen.sleep(0.01)
 
-    steal.move_task_request(future.key, a.address, b.address)
+    steal.move_task_request(s.tasks[future.key],
+                            s.workers[a.address], s.workers[b.address])
     yield gen.sleep(0.1)
     assert future.key in a.executing
     assert not b.executing
@@ -605,3 +621,17 @@ def test_cleanup_repeated_tasks(c, s, a, b):
     assert not any(s.has_what.values())
 
     assert not list(ws)
+
+
+@gen_cluster(client=True, ncores=[('127.0.0.1', 1)] * 2)
+def test_lose_task(c, s, a, b):
+    with captured_logger('distributed.stealing') as log:
+        s.periodic_callbacks['stealing'].interval = 1
+        for i in range(100):
+            futures = c.map(slowinc, range(10), delay=0.01, pure=False,
+                            workers=a.address, allow_other_workers=True)
+            yield gen.sleep(0.01)
+            del futures
+
+    out = log.getvalue()
+    assert 'Error' not in out

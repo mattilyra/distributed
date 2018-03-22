@@ -16,7 +16,7 @@ from tornado.locks import Event
 from distributed.metrics import time
 from distributed.process import AsyncProcess
 from distributed.utils import mp_context
-from distributed.utils_test import gen_test, pristine_loop
+from distributed.utils_test import gen_test, pristine_loop, nodebug
 
 
 def feed(in_q, out_q):
@@ -49,6 +49,7 @@ def threads_info(q):
     q.put(threading.current_thread().name)
 
 
+@nodebug
 @gen_test()
 def test_simple():
     to_child = mp_context.Queue()
@@ -106,6 +107,12 @@ def test_simple():
 
     del proc
     gc.collect()
+    start = time()
+    while wr1() is not None and time() < start + 1:
+        # Perhaps the GIL switched before _watch_process() exit,
+        # help it a little
+        sleep(0.001)
+        gc.collect()
     if wr1() is not None:
         # Help diagnosing
         from types import FrameType

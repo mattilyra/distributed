@@ -13,11 +13,12 @@ from toolz import valmap, first
 from tornado import gen
 
 from distributed import Nanny, rpc, Scheduler
+from distributed.config import config
 from distributed.core import CommClosedError
 from distributed.metrics import time
 from distributed.protocol.pickle import dumps
 from distributed.utils import ignoring, tmpfile
-from distributed.utils_test import (gen_cluster, gen_test, slow,
+from distributed.utils_test import (gen_cluster, gen_test, slow, inc,
         captured_logger)
 
 
@@ -222,7 +223,7 @@ def test_scheduler_file():
         s.start(8008)
         w = Nanny(scheduler_file=fn)
         yield w._start()
-        assert s.workers == {w.worker_address}
+        assert set(s.workers) == {w.worker_address}
         yield w._close()
         s.stop()
 
@@ -244,7 +245,7 @@ def test_nanny_timeout(c, s, a):
 
 
 @gen_cluster(ncores=[('127.0.0.1', 1)], client=True, Worker=Nanny,
-             worker_kwargs={'memory_limit': 1e9}, timeout=20)
+             worker_kwargs={'memory_limit': 1e8}, timeout=20)
 def test_nanny_terminate(c, s, a):
     from time import sleep
 
@@ -252,7 +253,7 @@ def test_nanny_terminate(c, s, a):
         L = []
         while True:
             L.append(b'0' * 5000000)
-            sleep(0.001)
+            sleep(0.01)
 
     proc = a.process.pid
     with captured_logger(logging.getLogger('distributed.nanny')) as logger:
@@ -264,3 +265,40 @@ def test_nanny_terminate(c, s, a):
         out = logger.getvalue()
         assert 'restart' in out.lower()
         assert 'memory' in out.lower()
+
+
+@gen_cluster(ncores=[], client=True)
+def test_avoid_memory_monitor_if_zero_limit(c, s):
+    nanny = Nanny(s.address, loop=s.loop, memory_limit=0)
+    yield nanny._start()
+    typ = yield c.run(lambda dask_worker: type(dask_worker.data))
+    assert typ == {nanny.worker_address: dict}
+    pcs = yield c.run(lambda dask_worker: list(dask_worker.periodic_callbacks))
+    assert 'memory' not in pcs
+    assert 'memory' not in nanny.periodic_callbacks
+
+    future = c.submit(inc, 1)
+    assert (yield future) == 2
+    yield gen.sleep(0.02)
+
+    yield c.submit(inc, 2)  # worker doesn't pause
+
+    yield nanny._close()
+
+
+@gen_cluster(ncores=[], client=True)
+def test_scheduler_address_config(c, s):
+    config['scheduler-address'] = s.address
+    try:
+        nanny = Nanny(loop=s.loop)
+        yield nanny._start()
+        assert nanny.scheduler.address == s.address
+
+        start = time()
+        while not s.workers:
+            yield gen.sleep(0.1)
+            assert time() < start + 10
+
+    finally:
+        del config['scheduler-address']
+    yield nanny._close()

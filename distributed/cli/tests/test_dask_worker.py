@@ -12,7 +12,7 @@ from distributed.metrics import time
 from distributed.utils import sync, tmpfile
 from distributed.utils_test import (popen, slow, terminate_process,
                                     wait_for_port)
-from distributed.utils_test import loop  # flake8: noqa
+from distributed.utils_test import loop  # noqa: F401
 
 
 def test_nanny_worker_ports(loop):
@@ -34,14 +34,14 @@ def test_nanny_worker_ports(loop):
 
 def test_memory_limit(loop):
     with popen(['dask-scheduler', '--no-bokeh']) as sched:
-        with popen(['dask-worker', '127.0.0.1:8786', '--memory-limit', '2e9',
+        with popen(['dask-worker', '127.0.0.1:8786', '--memory-limit', '2e3MB',
                     '--no-bokeh']) as worker:
             with Client('127.0.0.1:8786', loop=loop) as c:
                 while not c.ncores():
                     sleep(0.1)
                 info = c.scheduler_info()
                 d = first(info['workers'].values())
-                assert isinstance(d['memory_limit'], float)
+                assert isinstance(d['memory_limit'], int)
                 assert d['memory_limit'] == 2e9
 
 
@@ -114,6 +114,24 @@ def test_nprocs_requires_nanny(loop):
                     '--no-nanny']) as worker:
             assert any(b'Failed to launch worker' in worker.stderr.readline()
                        for i in range(15))
+
+
+def test_nprocs_expands_name(loop):
+    with popen(['dask-scheduler', '--no-bokeh']) as sched:
+        with popen(['dask-worker', '127.0.0.1:8786', '--nprocs', '2',
+                    '--name', 'foo']) as worker:
+            with popen(['dask-worker', '127.0.0.1:8786', '--nprocs', '2']) as worker:
+                with Client('tcp://127.0.0.1:8786', loop=loop) as c:
+                    start = time()
+                    while len(c.scheduler_info()['workers']) < 4:
+                        sleep(0.2)
+                        assert time() < start + 10
+
+                    info = c.scheduler_info()
+                    names = [d['name'] for d in info['workers'].values()]
+                    foos = [n for n in names if n.startswith('foo')]
+                    assert len(foos) == 2
+                    assert len(set(names)) == 4
 
 
 @pytest.mark.skipif(not sys.platform.startswith('linux'),

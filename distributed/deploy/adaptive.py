@@ -25,6 +25,8 @@ class Adaptive(object):
         Affects quickly to adapt to high tasks per worker loads
     scale_factor : int, default 2
         Factor to scale by when it's determined additional workers are needed
+    **kwargs:
+        Extra parameters to pass to Scheduler.workers_to_close
 
     Examples
     --------
@@ -47,7 +49,7 @@ class Adaptive(object):
     '''
 
     def __init__(self, scheduler, cluster, interval=1000, startup_cost=1,
-                 scale_factor=2):
+                 scale_factor=2, **kwargs):
         self.scheduler = scheduler
         self.cluster = cluster
         self.startup_cost = startup_cost
@@ -55,6 +57,7 @@ class Adaptive(object):
         self._adapt_callback = PeriodicCallback(self._adapt, interval)
         self.scheduler.loop.add_callback(self._adapt_callback.start)
         self._adapting = False
+        self._workers_to_close_kwargs = kwargs
 
     def needs_cpu(self):
         """
@@ -66,7 +69,7 @@ class Adaptive(object):
         than ``startup_cost``.
         """
         total_occupancy = self.scheduler.total_occupancy
-        total_cores = sum(self.scheduler.ncores.values())
+        total_cores = sum([ws.ncores for ws in self.scheduler.workers.values()])
 
         if total_occupancy / (total_cores + 1e-9) > self.startup_cost * 2:
             logger.info("CPU limit exceeded [%d occupancy / %d cores]",
@@ -86,10 +89,10 @@ class Adaptive(object):
         """
         limit_bytes = {w: self.scheduler.worker_info[w]['memory_limit']
                         for w in self.scheduler.worker_info}
-        worker_bytes = self.scheduler.worker_bytes
+        worker_bytes = [ws.nbytes for ws in self.scheduler.workers.values()]
 
         limit = sum(limit_bytes.values())
-        total = sum(worker_bytes.values())
+        total = sum(worker_bytes)
         if total > 0.6 * limit:
             logger.info("Ram limit exceeded [%d/%d]", limit, total)
             return True
@@ -118,7 +121,7 @@ class Adaptive(object):
         needs_memory
         """
         with log_errors():
-            if self.scheduler.unrunnable and not self.scheduler.ncores:
+            if self.scheduler.unrunnable and not self.scheduler.workers:
                 return True
 
             needs_cpu = self.needs_cpu()
@@ -140,20 +143,43 @@ class Adaptive(object):
 
         Notes
         -----
-        ``Adaptive.should_scale_down`` always returns True, so we will always
-        attempt to remove workers as determined by
-        ``Scheduler.workers_to_close``.
+        ``Adaptive.should_scale_down`` defaults to dispatching to
+        ``Adaptive.workers_to_close``, returning True if any workers to close
+        are specified.
 
         See Also
         --------
         Scheduler.workers_to_close
         """
-        return True
+        return len(self.workers_to_close()) > 0
+
+    def workers_to_close(self, **kwargs):
+        """
+        Determine which, if any, workers should potentially be removed from
+        the cluster.
+
+        Returns
+        -------
+        workers: [worker_name]
+
+        Notes
+        -----
+        ``Adaptive.workers_to_close`` dispatches to Scheduler.workers_to_close(),
+        but may be overridden in subclasses.
+
+        See Also
+        --------
+        Scheduler.workers_to_close
+        """
+        kw = dict(self._workers_to_close_kwargs)
+        kw.update(kwargs)
+        return self.scheduler.workers_to_close(**kw)
 
     @gen.coroutine
     def _retire_workers(self):
         with log_errors():
-            workers = yield self.scheduler.retire_workers(remove=True,
+            workers = yield self.scheduler.retire_workers(workers=self.workers_to_close(),
+                                                          remove=True,
                                                           close_workers=True)
 
             if workers:
@@ -177,7 +203,7 @@ class Adaptive(object):
         --------
         LocalCluster.scale_up
         """
-        instances = max(1, len(self.scheduler.ncores) * self.scale_factor)
+        instances = max(1, len(self.scheduler.workers) * self.scale_factor)
         logger.info("Scaling up to %d workers", instances)
         return {'n': instances}
 
@@ -188,14 +214,19 @@ class Adaptive(object):
 
         self._adapting = True
         try:
-            if self.should_scale_up():
-                kwargs = self.get_scale_up_kwargs()
-                f = self.cluster.scale_up(**kwargs)
-                if gen.is_future(f):
-                    yield f
+            should_scale_up = self.should_scale_up()
+            should_scale_down = self.should_scale_down()
+            if should_scale_up and should_scale_down:
+                logger.info("Attempting to scale up and scale down simultaneously.")
+            else:
+                if should_scale_up:
+                    kwargs = self.get_scale_up_kwargs()
+                    f = self.cluster.scale_up(**kwargs)
+                    if gen.is_future(f):
+                        yield f
 
-            if self.should_scale_down():
-                yield self._retire_workers()
+                if should_scale_down:
+                    yield self._retire_workers()
         finally:
             self._adapting = False
 

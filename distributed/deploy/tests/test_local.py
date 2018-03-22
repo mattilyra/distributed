@@ -18,7 +18,7 @@ from distributed.utils_test import (inc, gen_test,
                                     assert_can_connect_locally_4,
                                     assert_can_connect_from_everywhere_4_6,
                                     captured_logger)
-from distributed.utils_test import loop  # flake8: noqa
+from distributed.utils_test import loop  # noqa: F401
 from distributed.utils import sync
 from distributed.worker import TOTAL_MEMORY
 
@@ -36,17 +36,17 @@ def test_simple(loop):
 
 
 def test_close_twice():
-    cluster = LocalCluster()
-    with Client(cluster.scheduler_address) as client:
-        f = client.map(inc, range(100))
-        client.gather(f)
-    with captured_logger('tornado.application') as log:
-        cluster.close()
-        cluster.close()
-        sleep(0.5)
-    log = log.getvalue()
-    print(log)
-    assert not log
+    with LocalCluster() as cluster:
+        with Client(cluster.scheduler_address) as client:
+            f = client.map(inc, range(100))
+            client.gather(f)
+        with captured_logger('tornado.application') as log:
+            cluster.close()
+            cluster.close()
+            sleep(0.5)
+        log = log.getvalue()
+        print(log)
+        assert not log
 
 
 @pytest.mark.skipif('sys.version_info[0] == 2', reason='multi-loop')
@@ -192,6 +192,14 @@ def test_worker_params():
         assert [w.memory_limit for w in c.workers] == [500] * 2
 
 
+def test_memory_limit_none():
+    with LocalCluster(n_workers=2, scheduler_port=0, silence_logs=False,
+                      processes=False,  diagnostics_port=None, memory_limit=None) as c:
+        w = c.workers[0]
+        assert type(w.data) is dict
+        assert w.memory_limit is None
+
+
 def test_cleanup():
     c = LocalCluster(2, scheduler_port=0, silence_logs=False,
                      diagnostics_port=None)
@@ -211,11 +219,12 @@ def test_repeated():
         pass
 
 
-def test_bokeh(loop):
+@pytest.mark.parametrize('processes', [True, False])
+def test_bokeh(loop, processes):
     pytest.importorskip('bokeh')
     import requests
     with LocalCluster(scheduler_port=0, silence_logs=False, loop=loop,
-                      diagnostics_port=0) as c:
+                      processes=processes, diagnostics_port=0) as c:
         bokeh_port = c.scheduler.services['bokeh'].port
         url = 'http://127.0.0.1:%d/status/' % bokeh_port
         start = time()
@@ -225,6 +234,9 @@ def test_bokeh(loop):
                 break
             assert time() < start + 20
             sleep(0.01)
+        # 'localhost' also works
+        response = requests.get('http://localhost:%d/status/' % bokeh_port)
+        assert response.ok
 
     with pytest.raises(requests.RequestException):
         requests.get(url, timeout=0.2)
@@ -313,19 +325,22 @@ def test_death_timeout_raises(loop):
             pass
 
 
-@pytest.mark.parametrize('processes', [True, False])
-def test_diagnostics_available_at_localhost(loop, processes):
+@pytest.mark.skipif(sys.version_info < (3, 6), reason='Unknown')
+def test_bokeh_kwargs(loop):
     pytest.importorskip('bokeh')
-    import requests
-    import random
-    for i in range(3):
-        port = random.randint(10000, 60000)
-        try:
-            with LocalCluster(2, scheduler_port=0, processes=processes,
-                              silence_logs=False, diagnostics_port=port, loop=loop) as c:
-                requests.get('http://localhost:%d/status/' % port, timeout=1)
-                requests.get('http://127.0.0.1:%d/status/' % port, timeout=1)
-        except OSError:
-            pass
-        else:
-            break
+    with LocalCluster(scheduler_port=0, silence_logs=False, loop=loop,
+                      diagnostics_port=0,
+                      service_kwargs={'bokeh': {'prefix': '/foo'}}) as c:
+
+        bs = c.scheduler.services['bokeh']
+        assert bs.prefix == '/foo'
+
+
+def test_io_loop_periodic_callbacks(loop):
+    with LocalCluster(loop=loop) as cluster:
+        assert cluster.scheduler.loop is loop
+        for pc in cluster.scheduler.periodic_callbacks.values():
+            assert pc.io_loop is loop
+        for worker in cluster.workers:
+            for pc in worker.periodic_callbacks.values():
+                assert pc.io_loop is loop

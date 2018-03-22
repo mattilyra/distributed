@@ -6,22 +6,15 @@ from time import time
 import weakref
 
 from bokeh.layouts import row, column
-from bokeh.models import (
-    ColumnDataSource, Plot, DataRange1d, LinearAxis,
-    DatetimeAxis, HoverTool, BoxZoomTool, ResetTool,
-    PanTool, WheelZoomTool, Title, Range1d, Quad, Text, value, Line,
-    NumeralTickFormatter, ToolbarBox, Legend, BoxSelectTool, TapTool,
-    Circle, OpenURL,
-)
-from bokeh.models.widgets import (DataTable, TableColumn, NumberFormatter,
-        Button, Select)
+from bokeh.models import ( ColumnDataSource, Plot, DataRange1d, LinearAxis,
+        HoverTool, BoxZoomTool, ResetTool, PanTool, WheelZoomTool, Range1d,
+        Quad, TapTool, OpenURL, Button, Select)
 from bokeh.palettes import Spectral9
 from bokeh.plotting import figure
-from toolz import valmap
 from tornado import gen
 
 from ..config import config
-from ..diagnostics.progress_stream import progress_quads, nbytes_bar
+from ..diagnostics.progress_stream import nbytes_bar
 from .. import profile
 from ..utils import log_errors
 
@@ -70,7 +63,7 @@ class TaskStream(DashboardComponent):
 
         self.source = ColumnDataSource(data=dict(
             start=[time() - clear_interval], duration=[0.1], key=['start'],
-            name=['start'], color=['white'],
+            name=['start'], color=['white'], duration_text=['100 ms'],
             worker=['foo'], y=[0], worker_thread=[1], alpha=[0.0])
         )
 
@@ -98,8 +91,7 @@ class TaskStream(DashboardComponent):
             tooltips="""
                 <div>
                     <span style="font-size: 12px; font-weight: bold;">@name:</span>&nbsp;
-                    <span style="font-size: 10px; font-family: Monaco, monospace;">@duration</span>
-                    <span style="font-size: 10px;">ms</span>&nbsp;
+                    <span style="font-size: 10px; font-family: Monaco, monospace;">@duration_text</span>
                 </div>
                 """
         )
@@ -109,7 +101,7 @@ class TaskStream(DashboardComponent):
         self.root.add_tools(
             hover, tap,
             BoxZoomTool(),
-            ResetTool(reset_size=False),
+            ResetTool(),
             PanTool(dimensions="width"),
             WheelZoomTool(dimensions="width")
         )
@@ -144,90 +136,6 @@ class TaskStream(DashboardComponent):
                         return
 
             self.source.stream(rectangles, self.n_rectangles)
-
-
-class TaskProgress(DashboardComponent):
-    """ Progress bars per task type """
-
-    def __init__(self, **kwargs):
-        data = progress_quads(dict(all={}, memory={}, erred={}, released={}))
-        self.source = ColumnDataSource(data=data)
-
-        x_range = DataRange1d()
-        y_range = Range1d(-8, 0)
-
-        self.root = Plot(
-            id='bk-task-progress-plot',
-            x_range=x_range, y_range=y_range, toolbar_location=None, **kwargs
-        )
-        self.root.add_glyph(
-            self.source,
-            Quad(top='top', bottom='bottom', left='left', right='right',
-                 fill_color="#aaaaaa", line_color="#aaaaaa", fill_alpha=0.2)
-        )
-        self.root.add_glyph(
-            self.source,
-            Quad(top='top', bottom='bottom', left='left', right='released-loc',
-                 fill_color="color", line_color="color", fill_alpha=0.6)
-        )
-        self.root.add_glyph(
-            self.source,
-            Quad(top='top', bottom='bottom', left='released-loc',
-                 right='memory-loc', fill_color="color", line_color="color",
-                 fill_alpha=1.0)
-        )
-        self.root.add_glyph(
-            self.source,
-            Quad(top='top', bottom='bottom', left='erred-loc',
-                 right='erred-loc', fill_color='#000000', line_color='#000000',
-                 fill_alpha=0.3)
-        )
-        self.root.add_glyph(
-            self.source,
-            Text(text='show-name', y='bottom', x='left', x_offset=5,
-                 text_font_size=value('10pt'))
-        )
-        self.root.add_glyph(
-            self.source,
-            Text(text='done', y='bottom', x='right', x_offset=-5,
-                 text_align='right', text_font_size=value('10pt'))
-        )
-
-        hover = HoverTool(
-            point_policy="follow_mouse",
-            tooltips="""
-                <div>
-                    <span style="font-size: 14px; font-weight: bold;">Name:</span>&nbsp;
-                    <span style="font-size: 10px; font-family: Monaco, monospace;">@name</span>
-                </div>
-                <div>
-                    <span style="font-size: 14px; font-weight: bold;">All:</span>&nbsp;
-                    <span style="font-size: 10px; font-family: Monaco, monospace;">@all</span>
-                </div>
-                <div>
-                    <span style="font-size: 14px; font-weight: bold;">Memory:</span>&nbsp;
-                    <span style="font-size: 10px; font-family: Monaco, monospace;">@memory</span>
-                </div>
-                <div>
-                    <span style="font-size: 14px; font-weight: bold;">Erred:</span>&nbsp;
-                    <span style="font-size: 10px; font-family: Monaco, monospace;">@erred</span>
-                </div>
-                """
-        )
-        self.root.add_tools(hover)
-
-    def update(self, messages):
-        with log_errors():
-            msg = messages['progress']
-            if not msg:
-                return
-            d = progress_quads(msg)
-            self.source.data.update(d)
-            if messages['tasks']['deque']:
-                self.root.title.text = ("Progress -- total: %(total)s, "
-                                        "in-memory: %(in-memory)s, processing: %(processing)s, "
-                                        "waiting: %(waiting)s, failed: %(failed)s"
-                                        % messages['tasks']['deque'][-1])
 
 
 class MemoryUsage(DashboardComponent):
@@ -281,202 +189,6 @@ class MemoryUsage(DashboardComponent):
             self.source.data.update(nb)
             self.root.title.text = \
                 "Memory Use: %0.2f MB" % (sum(msg['nbytes'].values()) / 1e6)
-
-
-class ResourceProfiles(DashboardComponent):
-    """ Time plots of the current resource usage on the cluster
-
-    This is two plots, one for CPU and Memory and another for Network I/O
-    """
-
-    def __init__(self, **kwargs):
-        self.source = ColumnDataSource(data={'time': [], 'cpu': [],
-                                             'memory_percent': [], 'network-send': [], 'network-recv': []}
-                                       )
-
-        x_range = DataRange1d(follow='end', follow_interval=30000, range_padding=0)
-
-        resource_plot = Plot(
-            x_range=x_range, y_range=Range1d(start=0, end=1),
-            toolbar_location=None, min_border_bottom=10, **kwargs
-        )
-
-        line_opts = dict(line_width=2, line_alpha=0.8)
-        g1 = resource_plot.add_glyph(
-            self.source,
-            Line(x='time', y='memory_percent', line_color="#33a02c", **line_opts)
-        )
-        g2 = resource_plot.add_glyph(
-            self.source,
-            Line(x='time', y='cpu', line_color="#1f78b4", **line_opts)
-        )
-
-        resource_plot.add_layout(
-            LinearAxis(formatter=NumeralTickFormatter(format="0 %")),
-            'left'
-        )
-
-        legend_opts = dict(
-            location='top_left', orientation='horizontal', padding=5, margin=5,
-            label_height=5)
-
-        resource_plot.add_layout(
-            Legend(items=[('Memory', [g1]), ('CPU', [g2])], **legend_opts)
-        )
-
-        network_plot = Plot(
-            x_range=x_range, y_range=DataRange1d(start=0),
-            toolbar_location=None, **kwargs
-        )
-        g1 = network_plot.add_glyph(
-            self.source,
-            Line(x='time', y='network-send', line_color="#a6cee3", **line_opts)
-        )
-        g2 = network_plot.add_glyph(
-            self.source,
-            Line(x='time', y='network-recv', line_color="#b2df8a", **line_opts)
-        )
-
-        network_plot.add_layout(DatetimeAxis(axis_label="Time"), "below")
-        network_plot.add_layout(LinearAxis(axis_label="MB/s"), 'left')
-        network_plot.add_layout(
-            Legend(items=[('Network Send', [g1]), ('Network Recv', [g2])], **legend_opts)
-        )
-
-        tools = [
-            PanTool(dimensions='width'), WheelZoomTool(dimensions='width'),
-            BoxZoomTool(), ResetTool()
-        ]
-
-        if 'sizing_mode' in kwargs:
-            sizing_mode = {'sizing_mode': kwargs['sizing_mode']}
-        else:
-            sizing_mode = {}
-
-        combo_toolbar = ToolbarBox(
-            tools=tools, logo=None, toolbar_location='right', **sizing_mode
-        )
-
-        self.root = row(
-            column(resource_plot, network_plot, **sizing_mode),
-            column(combo_toolbar, **sizing_mode),
-            id='bk-resource-profiles-plot',
-            **sizing_mode
-        )
-
-        # Required for update callback
-        self.resource_index = [0]
-
-    def update(self, messages):
-        with log_errors():
-            index = messages['workers']['index']
-            data = messages['workers']['plot-data']
-
-            if not index or index[-1] == self.resource_index[0]:
-                return
-
-            if self.resource_index == [0]:
-                data = valmap(list, data)
-
-            ind = bisect(index, self.resource_index[0])
-            indexes = list(range(ind, len(index)))
-            data = {k: [v[i] for i in indexes] for k, v in data.items()}
-            self.resource_index[0] = index[-1]
-            self.source.stream(data, 1000)
-
-
-class WorkerTable(DashboardComponent):
-    """ Status of the current workers
-
-    This is two plots, a text-based table for each host and a thin horizontal
-    plot laying out hosts by their current memory use.
-    """
-
-    def __init__(self, **kwargs):
-        names = ['processes', 'disk-read', 'cores', 'cpu', 'disk-write',
-                 'memory', 'last-seen', 'memory_percent', 'host']
-        self.source = ColumnDataSource({k: [] for k in names})
-
-        columns = {name: TableColumn(field=name,
-                                     title=name.replace('_percent', ' %'))
-                   for name in names}
-
-        cnames = ['host', 'cores', 'processes', 'memory', 'cpu', 'memory_percent']
-
-        formatters = {'cpu': NumberFormatter(format='0.0 %'),
-                      'memory_percent': NumberFormatter(format='0.0 %'),
-                      'memory': NumberFormatter(format='0 b'),
-                      'latency': NumberFormatter(format='0.00000'),
-                      'last-seen': NumberFormatter(format='0.000'),
-                      'disk-read': NumberFormatter(format='0 b'),
-                      'disk-write': NumberFormatter(format='0 b'),
-                      'net-send': NumberFormatter(format='0 b'),
-                      'net-recv': NumberFormatter(format='0 b')}
-
-        table = DataTable(
-            source=self.source, columns=[columns[n] for n in cnames],
-        )
-
-        for name in cnames:
-            if name in formatters:
-                table.columns[cnames.index(name)].formatter = formatters[name]
-
-        mem_plot = Plot(
-            title=Title(text="Memory Usage (%)"), toolbar_location=None,
-            x_range=Range1d(start=0, end=1), y_range=Range1d(start=-0.1, end=0.1),
-            **kwargs
-        )
-
-        mem_plot.add_glyph(
-            self.source,
-            Circle(x='memory_percent', y=0, size=10, fill_alpha=0.5)
-        )
-
-        mem_plot.add_layout(LinearAxis(), 'below')
-
-        hover = HoverTool(
-            point_policy="follow_mouse",
-            tooltips="""
-                <div>
-                  <span style="font-size: 10px; font-family: Monaco, monospace;">@host: </span>
-                  <span style="font-size: 10px; font-family: Monaco, monospace;">@memory_percent</span>
-                </div>
-                """
-        )
-        mem_plot.add_tools(hover, BoxSelectTool())
-
-        if 'sizing_mode' in kwargs:
-            sizing_mode = {'sizing_mode': kwargs['sizing_mode']}
-        else:
-            sizing_mode = {}
-
-        self.root = column(mem_plot, table, id='bk-worker-table', **sizing_mode)
-
-    def update(self, messages):
-        with log_errors():
-            try:
-                d = messages['workers']['deque'][-1]
-            except IndexError:
-                return
-
-            workers = sorted(d)
-
-            data = {}
-            data['host'] = workers
-            for name in ['cores', 'cpu', 'memory_percent', 'latency', 'last-seen',
-                         'memory', 'disk-read', 'disk-write', 'net-send',
-                         'net-recv']:
-                try:
-                    if name in ('cpu', 'memory_percent'):
-                        data[name] = [d[w][name] / 100 for w in workers]
-                    else:
-                        data[name] = [d[w][name] for w in workers]
-                except KeyError:
-                    pass
-
-            data['processing'] = [sorted(d[w]['processing']) for w in workers]
-            data['processes'] = [len(d[w]['addresses']) for w in workers]
-            self.source.data.update(data)
 
 
 class Processing(DashboardComponent):

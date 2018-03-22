@@ -1,6 +1,130 @@
 Changelog
 =========
 
+1.21.1 - 2018-02-22
+-------------------
+
+-  Fixed an uncaught exception in ``distributed.joblib`` with a ``LocalCluster`` using only threads (:issue:`1775`) `Tom Augspurger`_
+-  Format bytes in info worker page (:pr:`1752`) `Matthew Rocklin`_
+-  Add pass-through arguments for scheduler/worker `--preload` modules. (:pr:`1634`) `Alexander Ford`_
+-  Use new LZ4 API (:pr:`1757`) `Thrasibule`_
+-  Replace dask.optimize with dask.optimization (:pr:`1754`) `Matthew Rocklin`_
+-  Add graph layout engine and bokeh plot (:pr:`1756`) `Matthew Rocklin`_
+-  Only expand name with --nprocs if name exists (:pr:`1776`) `Matthew Rocklin`_
+-  specify IOLoop for stealing PeriodicCallback (:pr:`1777`) `Matthew Rocklin`_
+-  Fixed distributed.joblib with no processes `Tom Augspurger`_
+-  Use set.discard to avoid KeyErrors in stealing (:pr:`1766`) `Matthew Rocklin`_
+-  Avoid KeyError when task has been released during steal (:pr:`1765`) `Matthew Rocklin`_
+-  Add versions routes to avoid the use of run in Client.get_versions (:pr:`1773`) `Matthew Rocklin`_
+-  Add write_scheduler_file to Client (:pr:`1778`) `Joe Hamman`_
+-  Default host to tls:// if tls information provided (:pr:`1780`) `Matthew Rocklin`_
+
+
+1.21.0 - 2018-02-09
+-------------------
+
+-  Refactor scheduler to use TaskState objects rather than dictionaries (:pr:`1594`) `Antoine Pitrou`_
+-  Plot CPU fraction of total in workers page (:pr:`1624`) `Matthew Rocklin`_
+-  Use thread CPU time in Throttled GC (:pr:`1625`) `Antoine Pitrou`_
+-  Fix bug with ``memory_limit=None`` (:pr:`1639`) `Matthew Rocklin`_
+-  Add futures_of to top level api (:pr:`1646`) `Matthew Rocklin`_
+-  Warn on serializing large data in Client (:pr:`1636`) `Matthew Rocklin`_
+-  Fix intermittent windows failure when removing lock file (:pr:`1652`) `Antoine Pitrou`_
+-  Add diagnosis and logging of poor GC Behavior (:pr:`1635`) `Antoine Pitrou`_
+-  Add client-scheduler heartbeats (:pr:`1657`) `Matthew Rocklin`_
+-  Return dictionary of worker info in ``retire_workers`` (:pr:`1659`) `Matthew Rocklin`_
+-  Ensure dumps_function works with unhashable functions (:pr:`1662`) `Matthew Rocklin`_
+-  Collect client name ids rom client-name config variable (:pr:`1664`) `Matthew Rocklin`_
+-  Allow simultaneous use of --name and --nprocs in dask-worker (:pr:`1665`) `Matthew Rocklin`_
+-  Add support for grouped adaptive scaling and adaptive behavior overrides (:pr:`1632`) `Alexander Ford`_
+-  Share scheduler RPC between worker and client (:pr:`1673`) `Matthew Rocklin`_
+-  Allow ``retries=`` in ClientExecutor (:pr:`1672`) `@rqx`_
+-  Improve documentation for get_client and dask.compute examples (:pr:`1638`) `Scott Sievert`_
+-  Support DASK_SCHEDULER_ADDRESS environment variable in worker (:pr:`1680`) `Matthew Rocklin`_
+-  Support tuple-keys in retries (:pr:`1681`) `Matthew Rocklin`_
+-  Use relative links in bokeh dashboard (:pr:`1682`) `Matthew Rocklin`_
+-  Make message log length configurable, default to zero (:pr:`1691`) `Matthew Rocklin`_
+-  Deprecate ``Client.shutdown`` (:pr:`1699`) `Matthew Rocklin`_
+-  Add warning in configuration docs to install pyyaml (:pr:`1701`) `Cornelius Riemenschneider`_
+-  Handle nested parallelism in distributed.joblib (:pr:`1705`) `Tom Augspurger`_
+-  Don't wait for Worker.executor to shutdown cleanly when restarting process (:pr:`1708`) `Matthew Rocklin`_
+-  Add support for user defined priorities (:pr:`1651`) `Matthew Rocklin`_
+-  Catch and log OSErrors around worker lock files (:pr:`1714`) `Matthew Rocklin`_
+-  Remove worker prioritization.  Coincides with changes to dask.order (:pr:`1730`) `Matthew Rocklin`_
+-  Use process-measured memory rather than nbytes in Bokeh dashboard (:pr:`1737`) `Matthew Rocklin`_
+-  Enable serialization of Locks  (:pr:`1738`) `Matthew Rocklin`_
+-  Support Tornado 5 beta (:pr:`1735`) `Matthew Rocklin`_
+-  Cleanup remote_magic client cache after tests (:pr:`1743`) `Min RK`_
+-  Allow service ports to be specified as (host, port) (:pr:`1744`) `Bruce Merry`_
+
+
+1.20.2 - 2017-12-07
+-------------------
+
+-  Clear deque handlers after each test (:pr:`1586`) `Antoine Pitrou`_
+-  Handle deserialization in FutureState.set_error (:pr:`1592`) `Matthew Rocklin`_
+-  Add process leak checker to tests (:pr:`1596`) `Antoine Pitrou`_
+-  Customize process title for subprocess (:pr:`1590`) `Antoine Pitrou`_
+-  Make linting a separate CI job (:pr:`1599`) `Antoine Pitrou`_
+-  Fix error from get_client() with no global client (:pr:`1595`) `Daniel Li`_
+-  Remove Worker.host_health, correct WorkerTable metrics (:pr:`1600`) `Matthew Rocklin`_
+-  Don't mark tasks as suspicious when retire_workers called. Addresses (:pr:`1607`) `Russ Bubley`_
+-  Do not include processing workers in workers_to_close (:pr:`1609`) `Russ Bubley`_
+-  Disallow simultaneous scale up and down in Adaptive (:pr:`1608`) `Russ Bubley`_
+-  Parse bytestrings in --memory-limit (:pr:`1615`) `Matthew Rocklin`_
+-  Use environment variable for scheduler address if present (:pr:`1610`) `Matthew Rocklin`_
+-  Fix deprecation warning from logger.warn (:pr:`1616`) `Brett Naul`_
+
+
+
+
+1.20.1 - 2017-11-26
+-------------------
+
+- Wrap ``import ssl`` statements with try-except block for ssl-crippled environments, (:pr:`1570`) `Xander Johnson`_
+- Support zero memory-limit in Nanny (:pr:`1571`) `Matthew Rocklin`_
+- Avoid PeriodicCallback double starts (:pr:`1573`) `Matthew Rocklin`_
+- Add disposable workspace facility (:pr:`1543`) `Antoine Pitrou`_
+- Use format_time in task_stream plots (:pr:`1575`) `Matthew Rocklin`_
+- Avoid delayed finalize calls in compute (:pr:`1577`) `Matthew Rocklin`_
+- Doc fix about secede (:pr:`1583`) `Scott Sievert`_
+- Add tracemalloc option when tracking test leaks (:pr:`1585`) `Antoine Pitrou`_
+- Add JSON routes to Bokeh server (:pr:`1584`) `Matthew Rocklin`_
+- Handle exceptions cleanly in Variables and Queues (:pr:`1580`) `Matthew Rocklin`_
+
+
+1.20.0 - 2017-11-17
+-------------------
+
+-  Drop use of pandas.msgpack (:pr:`1473`) `Matthew Rocklin`_
+-  Add methods to get/set scheduler metadata `Matthew Rocklin`_
+-  Add distributed lock `Matthew Rocklin`_
+-  Add reschedule exception for worker tasks `Matthew Rocklin`_
+-  Fix ``nbytes()`` for ``bytearrays`` `Matthew Rocklin`_
+-  Capture scheduler and worker logs `Matthew Rocklin`_
+-  Garbage collect after data eviction on high worker memory usage (:pr:`1488`) `Olivier Grisel`_
+-  Add scheduler HTML routes to bokeh server (:pr:`1478`) (:pr:`1514`) `Matthew Rocklin`_
+-  Add pytest plugin to test for resource leaks (:pr:`1499`) `Antoine Pitrou`_
+-  Improve documentation for scheduler states (:pr:`1498`) `Antoine Pitrou`_
+-  Correct warn_if_longer timeout in ThrottledGC (:pr:`1496`) `Fabian Keller`_
+-  Catch race condition in as_completed on cancelled futures (:pr:`1507`) `Matthew Rocklin`_
+-  Transactional work stealing (:pr:`1489`) (:pr:`1528`) `Matthew Rocklin`_
+-  Avoid forkserver in PyPy (:pr:`1509`) `Matthew Rocklin`_
+-  Add dict access to get/set datasets (:pr:`1508`) `Mike DePalatis`_
+-  Support Tornado 5 (:pr:`1509`) (:pr:`1512`) (:pr:`1518`) (:pr:`1534`) `Antoine Pitrou`_
+-  Move thread_state in Dask (:pr:`1523`) `Jim Crist`_
+-  Use new Dask collections interface (:pr:`1513`) `Matthew Rocklin`_
+-  Add nanny flag to dask-mpi `Matthew Rocklin`_
+-  Remove JSON-based HTTP servers `Matthew Rocklin`_
+-  Avoid doing I/O in repr/str (:pr:`1536`) `Matthew Rocklin`_
+-  Fix URL for MPI4Py project (:pr:`1546`) `Ian Hopkinson`_
+-  Allow automatic retries of a failed task (:pr:`1524`) `Antoine Pitrou`_
+-  Clean and accelerate tests (:pr:`1548`) (:pr:`1549`) (:pr:`1552`)
+   (:pr:`1553`) (:pr:`1560`) (:pr:`1564`) `Antoine Pitrou`_
+- Move HDFS functionality to the hdfs3 library (:pr:`1561`) `Jim Crist`_
+-  Fix bug when using events page with no events (:pr:`1562`) `@rbubley`_
+-  Improve diagnostic naming of tasks within tuples (:pr:`1566`) `Kelvyn Yang`_
+
 1.19.3 - 2017-10-16
 -------------------
 
@@ -371,3 +495,25 @@ significantly without many new features.
 *  Refactor HDFS writing to align with changes in the dask library
 *  Executor reconnects to scheduler on broken connection or failed scheduler
 *  Support sklearn.external.joblib as well as normal joblib
+
+.. _`Antoine Pitrou`: https://github.com/pitrou
+.. _`Olivier Grisel`: https://github.com/ogrisel
+.. _`Fabian Keller`: https://github.com/bluenote10
+.. _`Mike DePalatis`: https://github.com/mivade
+.. _`Matthew Rocklin`: https://github.com/mrocklin
+.. _`Jim Crist`: https://github.com/jcrist
+.. _`Ian Hopkinson`: https://github.com/IanHopkinson
+.. _`@rbubley`: https://github.com/rbubley
+.. _`Kelvyn Yang`: https://github.com/kelvynyang
+.. _`Scott Sievert`: https://github.com/stsievert
+.. _`Xander Johnson`: https://github.com/metasyn
+.. _`Daniel Li`: https://github.com/li-dan
+.. _`Brett Naul`: https://github.com/bnaul
+.. _`Cornelius Riemenschneider`: https://github.com/corni
+.. _`Alexander Ford`: https://github.com/asford
+.. _`@rqx`: https://github.com/rqx
+.. _`Min RK`: https://github.comminrk/
+.. _`Bruce Merry`: https://github.com/bmerry
+.. _`Tom Augspurger`: https://github.com/TomAugspurger
+.. _`Joe Hamman`: https://github.com/jhamman
+.. _`Thrasibule`: https://github.com/thrasibule

@@ -8,6 +8,7 @@ import collections
 import gc
 import time
 import os
+import sys
 import threading
 
 import pytest
@@ -91,13 +92,19 @@ def register_checker(name):
 
 class ResourceChecker(object):
 
+    def on_start_test(self):
+        pass
+
+    def on_stop_test(self):
+        pass
+
+    def on_retry(self):
+        pass
+
     def measure(self):
         raise NotImplementedError
 
     def has_leak(self, before, after):
-        raise NotImplementedError
-
-    def on_retry(self):
         raise NotImplementedError
 
     def format(self, before, after):
@@ -117,9 +124,6 @@ class FDChecker(ResourceChecker):
     def has_leak(self, before, after):
         return after > before
 
-    def on_retry(self):
-        pass
-
     def format(self, before, after):
         return "leaked %d file descriptor(s)" % (after - before)
 
@@ -134,9 +138,6 @@ class RSSMemoryChecker(ResourceChecker):
     def has_leak(self, before, after):
         return after > before + 1e7
 
-    def on_retry(self):
-        pass
-
     def format(self, before, after):
         return "leaked %d MB of RSS memory" % ((after - before) / 1e6)
 
@@ -150,14 +151,106 @@ class ActiveThreadsChecker(ResourceChecker):
     def has_leak(self, before, after):
         return not after <= before
 
-    def on_retry(self):
-        pass
-
     def format(self, before, after):
         leaked = after - before
         assert leaked
         return ("leaked %d Python threads: %s"
                 % (len(leaked), sorted(leaked, key=str)))
+
+
+class _ChildProcess(collections.namedtuple('_ChildProcess',
+                                           ('pid', 'name', 'cmdline'))):
+
+    @classmethod
+    def from_process(cls, p):
+        return cls(p.pid, p.name(), p.cmdline())
+
+
+@register_checker('processes')
+class ChildProcessesChecker(ResourceChecker):
+
+    def measure(self):
+        import psutil
+        # We use pid and creation time as keys to disambiguate between
+        # processes (and protect against pid reuse)
+        # Other properties such as cmdline may change for a given process
+        children = {}
+        p = psutil.Process()
+        for c in p.children(recursive=True):
+            try:
+                with c.oneshot():
+                    if c.ppid() == p.pid and os.path.samefile(c.exe(), sys.executable):
+                        cmdline = c.cmdline()
+                        if any(a.startswith('from multiprocessing.semaphore_tracker import main')
+                               for a in cmdline):
+                            # Skip multiprocessing semaphore tracker
+                            continue
+                        if any(a.startswith('from multiprocessing.forkserver import main')
+                               for a in cmdline):
+                            # Skip forkserver process, the forkserver's children
+                            # however will be recorded normally
+                            continue
+                    children[(c.pid, c.create_time())] = _ChildProcess.from_process(c)
+            except psutil.NoSuchProcess:
+                pass
+        return children
+
+    def has_leak(self, before, after):
+        return not set(after) <= set(before)
+
+    def format(self, before, after):
+        leaked = set(after) - set(before)
+        assert leaked
+        formatted = []
+        for key in sorted(leaked):
+            p = after[key]
+            formatted.append('  - pid={p.pid}, name={p.name!r}, cmdline={p.cmdline!r}'
+                             .format(p=p))
+        return ("leaked %d processes:\n%s"
+                % (len(leaked), '\n'.join(formatted)))
+
+
+@register_checker('tracemalloc')
+class TracemallocMemoryChecker(ResourceChecker):
+
+    def __init__(self):
+        global tracemalloc
+        import tracemalloc
+
+    def on_start_test(self):
+        tracemalloc.start(1)
+
+    def on_stop_test(self):
+        tracemalloc.stop()
+
+    def measure(self):
+        import tracemalloc
+        current, peak = tracemalloc.get_traced_memory()
+        snap = tracemalloc.take_snapshot()
+        return current, snap
+
+    def has_leak(self, before, after):
+        return after[0] > before[0] + 1e6
+
+    def format(self, before, after):
+        bytes_before, snap_before = before
+        bytes_after, snap_after = after
+        diff = snap_after.compare_to(snap_before, 'traceback')
+        ndiff = 5
+        min_size_diff = 2e5
+
+        lines = []
+        lines += ["leaked %.1f MB of traced Python memory"
+                  % ((bytes_after - bytes_before) / 1e6)]
+        for stat in diff[:ndiff]:
+            size_diff = stat.size_diff or stat.size
+            if size_diff < min_size_diff:
+                break
+            count = stat.count_diff or stat.count
+            lines += ["  - leaked %.1f MB in %d calls at:" % (size_diff / 1e6, count)]
+            lines += ["    " + line for line in stat.traceback.format()]
+
+        return "\n".join(lines)
 
 
 class LeakChecker(object):
@@ -191,6 +284,8 @@ class LeakChecker(object):
         return [(c, c.measure()) for c in self.checks_for_item(nodeid)]
 
     def measure_before_test(self, nodeid):
+        for checker in self.checks_for_item(nodeid):
+            checker.on_start_test()
         for checker, before in self.measure(nodeid):
             assert before is not None
             self.counters[nodeid][checker].append((before, None))
@@ -233,6 +328,9 @@ class LeakChecker(object):
             self.leaks[nodeid] = leaks
         else:
             self.leaks.pop(nodeid, None)
+
+        for checker in self.checks_for_item(nodeid):
+            checker.on_stop_test()
 
     def maybe_retry(self, item, nextitem=None):
         def run_test_again():

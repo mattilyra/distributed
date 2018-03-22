@@ -4,7 +4,6 @@ import atexit
 import logging
 import math
 from time import sleep
-import warnings
 import weakref
 
 from tornado import gen
@@ -39,8 +38,15 @@ class LocalCluster(object):
         Use a falsey value like False or None for no change.
     ip: string
         IP address on which the scheduler will listen, defaults to only localhost
+    diagnostics_port: int
+        Port on which the :doc:`web` will be provided.  8787 by default, use 0
+        to choose a random port, ``None`` to disable it, or an
+        :samp:`({ip}:{port})` tuple to listen on a different IP address than
+        the scheduler.
     kwargs: dict
         Extra worker arguments, will be passed to the Worker constructor.
+    service_kwargs: Dict[str, Dict]
+        Extra keywords to hand to the running services
 
     Examples
     --------
@@ -55,15 +61,14 @@ class LocalCluster(object):
 
     Shut down the extra worker
     >>> c.remove_worker(w)  # doctest: +SKIP
-    """
 
+    Pass extra keyword arguments to Bokeh
+    >>> LocalCluster(service_kwargs={'bokeh': {'prefix': '/foo'}})  # doctest: +SKIP
+    """
     def __init__(self, n_workers=None, threads_per_worker=None, processes=True,
                  loop=None, start=True, ip=None, scheduler_port=0,
                  silence_logs=logging.CRITICAL, diagnostics_port=8787,
-                 services={}, worker_services={}, nanny=None, **worker_kwargs):
-        if nanny is not None:
-            warnings.warning("nanny has been deprecated, used processes=")
-            processes = nanny
+                 services={}, worker_services={}, service_kwargs=None, **worker_kwargs):
         self.status = None
         self.processes = processes
         self.silence_logs = silence_logs
@@ -94,7 +99,7 @@ class LocalCluster(object):
             except ImportError:
                 logger.debug("To start diagnostics web server please install Bokeh")
             else:
-                services[('bokeh', diagnostics_port)] = BokehScheduler
+                services[('bokeh', diagnostics_port)] = (BokehScheduler, (service_kwargs or {}).get('bokeh', {}))
                 worker_services[('bokeh', 0)] = BokehWorker
 
         self.scheduler = Scheduler(loop=self.loop,
@@ -216,32 +221,39 @@ class LocalCluster(object):
 
     @gen.coroutine
     def _close(self):
+        # Can be 'closing' as we're called by close() below
         if self.status == 'closed':
             return
 
-        with ignoring(gen.TimeoutError, CommClosedError, OSError):
-            yield All([w._close() for w in self.workers])
-        with ignoring(gen.TimeoutError, CommClosedError, OSError):
-            yield self.scheduler.close(fast=True)
-        del self.workers[:]
-        self.status = 'closed'
+        try:
+            with ignoring(gen.TimeoutError, CommClosedError, OSError):
+                yield All([w._close() for w in self.workers])
+            with ignoring(gen.TimeoutError, CommClosedError, OSError):
+                yield self.scheduler.close(fast=True)
+            del self.workers[:]
+        finally:
+            self.status = 'closed'
 
-    def close(self):
+    def close(self, timeout=20):
         """ Close the cluster """
         if self.status == 'closed':
             return
 
-        self.scheduler.clear_task_state()
+        try:
+            self.scheduler.clear_task_state()
 
-        for w in self.workers:
-            self.loop.add_callback(self._stop_worker, w)
-        for i in range(10):
-            if not self.workers:
-                break
-            else:
-                sleep(0.01)
-        sync(self.loop, self._close)
-        self._loop_runner.stop()
+            for w in self.workers:
+                self.loop.add_callback(self._stop_worker, w)
+            for i in range(10):
+                if not self.workers:
+                    break
+                else:
+                    sleep(0.01)
+            del self.workers[:]
+            self._loop_runner.run_sync(self._close, callback_timeout=timeout)
+            self._loop_runner.stop()
+        finally:
+            self.status = 'closed'
 
     @gen.coroutine
     def scale_up(self, n, **kwargs):
@@ -294,5 +306,5 @@ clusters_to_close = weakref.WeakSet()
 
 @atexit.register
 def close_clusters():
-    for cluster in clusters_to_close:
-        cluster.close()
+    for cluster in list(clusters_to_close):
+        cluster.close(timeout=10)

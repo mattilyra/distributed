@@ -1,9 +1,12 @@
 from __future__ import print_function, division, absolute_import
 
+import collections
 from contextlib import contextmanager
 from datetime import timedelta
+import functools
 import gc
 from glob import glob
+import itertools
 import inspect
 import logging
 import logging.config
@@ -12,7 +15,6 @@ import re
 import shutil
 import signal
 import socket
-import ssl
 import subprocess
 import sys
 import tempfile
@@ -20,9 +22,14 @@ import textwrap
 import threading
 from time import sleep
 import uuid
-import warnings
 import weakref
 
+try:
+    import ssl
+except ImportError:
+    ssl = None
+
+import pytest
 import six
 
 from dask.context import _globals
@@ -31,16 +38,15 @@ from tornado import gen, queues
 from tornado.gen import TimeoutError
 from tornado.ioloop import IOLoop
 
-from .compatibility import WINDOWS
+from .compatibility import PY3
 from .config import config, initialize_logging
 from .core import connect, rpc, CommClosedError
 from .metrics import time
-from .nanny import Nanny
+from .proctitle import enable_proctitle_on_children
 from .security import Security
-from .utils import ignoring, log_errors, sync, mp_context, get_ip, get_ipv6
+from .utils import (ignoring, log_errors, mp_context, get_ip, get_ipv6,
+                    DequeHandler, reset_logger_locks)
 from .worker import Worker, TOTAL_MEMORY
-import pytest
-import psutil
 
 
 logger = logging.getLogger(__name__)
@@ -77,13 +83,28 @@ def invalid_python_script(tmpdir_factory):
 @pytest.fixture
 def loop():
     with pristine_loop() as loop:
+        # Monkey-patch IOLoop.start to wait for loop stop
+        orig_start = loop.start
+        is_stopped = threading.Event()
+        is_stopped.set()
+
+        def start():
+            is_stopped.clear()
+            try:
+                orig_start()
+            finally:
+                is_stopped.set()
+        loop.start = start
+
         yield loop
         # Stop the loop in case it's still running
         try:
-            sync(loop, loop.stop)
+            loop.add_callback(loop.stop)
         except RuntimeError as e:
             if not re.match("IOLoop is clos(ed|ing)", str(e)):
                 raise
+        else:
+            is_stopped.wait()
 
 
 @pytest.fixture
@@ -130,14 +151,65 @@ def pristine_loop():
 @contextmanager
 def mock_ipython():
     import mock
+    from distributed._ipython_utils import remote_magic
     ip = mock.Mock()
     ip.user_ns = {}
     ip.kernel = None
 
-    def get_ip(): return ip
+    def get_ip():
+        return ip
+
     with mock.patch('IPython.get_ipython', get_ip), \
             mock.patch('distributed._ipython_utils.get_ipython', get_ip):
         yield ip
+    # cleanup remote_magic client cache
+    for kc in remote_magic._clients.values():
+        kc.stop_channels()
+    remote_magic._clients.clear()
+
+
+def nodebug(func):
+    """
+    A decorator to disable debug facilities during timing-sensitive tests.
+    Warning: this doesn't affect already created IOLoops.
+    """
+    if not PY3:
+        # py.test's runner magic breaks horridly on Python 2
+        # when a test function is wrapped, so avoid it
+        # (incidently, asyncio is irrelevant anyway)
+        return func
+
+    @functools.wraps(func)
+    def wrapped(*args, **kwargs):
+        old_asyncio_debug = os.environ.get("PYTHONASYNCIODEBUG")
+        if old_asyncio_debug is not None:
+            del os.environ["PYTHONASYNCIODEBUG"]
+        try:
+            return func(*args, **kwargs)
+        finally:
+            if old_asyncio_debug is not None:
+                os.environ["PYTHONASYNCIODEBUG"] = old_asyncio_debug
+
+    return wrapped
+
+
+def nodebug_setup_module(module):
+    """
+    A setup_module() that you can install in a test module to disable
+    debug facilities.
+    """
+    module._old_asyncio_debug = os.environ.get("PYTHONASYNCIODEBUG")
+    if module._old_asyncio_debug is not None:
+        del os.environ["PYTHONASYNCIODEBUG"]
+
+
+def nodebug_teardown_module(module):
+    """
+    A teardown_module() that you can install in a test module to reenable
+    debug facilities.
+    """
+    if module._old_asyncio_debug is not None:
+        os.environ["PYTHONASYNCIODEBUG"] = module._old_asyncio_debug
 
 
 def inc(x):
@@ -211,6 +283,68 @@ def slowidentity(*args, **kwargs):
         return args
 
 
+def run_for(duration, timer=time):
+    """
+    Burn CPU for *duration* seconds.
+    """
+    deadline = timer() + duration
+    while timer() <= deadline:
+        pass
+
+
+# This dict grows at every varying() invocation
+_varying_dict = collections.defaultdict(int)
+_varying_key_gen = itertools.count()
+
+
+class _ModuleSlot(object):
+    def __init__(self, modname, slotname):
+        self.modname = modname
+        self.slotname = slotname
+
+    def get(self):
+        return getattr(sys.modules[self.modname], self.slotname)
+
+
+def varying(items):
+    """
+    Return a function that returns a result (or raises an exception)
+    from *items* at each call.
+    """
+    # cloudpickle would serialize the *values* of all globals
+    # used by *func* below, so we can't use `global <something>`.
+    # Instead look up the module by name to get the original namespace
+    # and not a copy.
+    slot = _ModuleSlot(__name__, '_varying_dict')
+    key = next(_varying_key_gen)
+
+    def func():
+        dct = slot.get()
+        i = dct[key]
+        if i == len(items):
+            raise IndexError
+        else:
+            x = items[i]
+            dct[key] = i + 1
+            if isinstance(x, Exception):
+                raise x
+            else:
+                return x
+
+    return func
+
+
+def map_varying(itemslists):
+    """
+    Like *varying*, but return the full specification for a map() call
+    on multiple items lists.
+    """
+    def apply(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    return apply, map(varying, itemslists)
+
+
 @gen.coroutine
 def geninc(x, delay=0.02):
     yield gen.sleep(delay)
@@ -231,7 +365,7 @@ if sys.version_info >= (3, 5):
             await gen.sleep(delay)
             return x + 1
         """)
-    assert asyncinc  # flake8: noqa
+    assert asyncinc  # noqa: F821
 else:
     asyncinc = None
 
@@ -291,6 +425,7 @@ def run_scheduler(q, nputs, **kwargs):
 def run_worker(q, scheduler_q, **kwargs):
     from distributed import Worker
 
+    reset_logger_locks()
     with log_errors():
         with pristine_loop() as loop:
             scheduler_addr = scheduler_q.get()
@@ -325,30 +460,29 @@ def run_nanny(q, scheduler_q, **kwargs):
 
 @contextmanager
 def check_active_rpc(loop, active_rpc_timeout=1):
-    if rpc.active > 0:
-        # Streams from a previous test dangling around?
+    active_before = set(rpc.active)
+    if active_before and not PY3:
+        # On Python 2, try to avoid dangling comms before forking workers
         gc.collect()
-    rpc_active = rpc.active
+        active_before = set(rpc.active)
     yield
-    if rpc.active > rpc_active and active_rpc_timeout:
-        # Some streams can take a bit of time to notice their peer
-        # has closed, and keep a coroutine (*) waiting for a CommClosedError
-        # before calling close_rpc() after a CommClosedError.
-        # This would happen especially if a non-localhost address is used,
-        # as Nanny does.
-        # (*) (example: gather_from_workers())
-        deadline = loop.time() + active_rpc_timeout
+    # Some streams can take a bit of time to notice their peer
+    # has closed, and keep a coroutine (*) waiting for a CommClosedError
+    # before calling close_rpc() after a CommClosedError.
+    # This would happen especially if a non-localhost address is used,
+    # as Nanny does.
+    # (*) (example: gather_from_workers())
 
-        @gen.coroutine
-        def wait_a_bit():
-            yield gen.sleep(0.01)
+    def fail():
+        pytest.fail("some RPCs left active by test: %s"
+                    % (sorted(set(rpc.active) - active_before)))
 
-        logger.info("Waiting for active RPC count to drop down")
-        while rpc.active > rpc_active and loop.time() < deadline:
-            loop.run_sync(wait_a_bit)
-        logger.info("... Finished waiting for active RPC count to drop down")
+    @gen.coroutine
+    def wait():
+        yield async_wait_for(lambda: len(set(rpc.active) - active_before) == 0,
+                             timeout=active_rpc_timeout, fail_func=fail)
 
-    assert rpc.active == rpc_active
+    loop.run_sync(wait)
 
 
 @contextmanager
@@ -359,6 +493,8 @@ def cluster(nworkers=2, nanny=False, worker_kwargs={}, active_rpc_timeout=1,
 
     for name, level in logging_levels.items():
         logging.getLogger(name).setLevel(level)
+
+    enable_proctitle_on_children()
 
     with pristine_loop() as loop:
         with check_active_rpc(loop, active_rpc_timeout):
@@ -464,18 +600,15 @@ def disconnect_all(addresses, timeout=3):
     yield [disconnect(addr, timeout) for addr in addresses]
 
 
-import pytest
-try:
-    slow = pytest.mark.skipif(
-        not pytest.config.getoption("--runslow"),
-        reason="need --runslow option to run")
-except (AttributeError, ValueError):
-    def slow(*args):
+def slow(func):
+    try:
+        if not pytest.config.getoption("--runslow"):
+            func = pytest.mark.skip("need --runslow option to run")(func)
+    except AttributeError:
+        # AttributeError: module 'pytest' has no attribute 'config'
         pass
 
-
-from tornado import gen
-from tornado.ioloop import IOLoop
+    return nodebug(func)
 
 
 def gen_test(timeout=10):
@@ -519,9 +652,11 @@ def start_cluster(ncores, scheduler_addr, loop, security=None,
     yield [w._start(ncore[0]) for ncore, w in zip(ncores, workers)]
 
     start = time()
-    while len(s.ncores) < len(ncores):
+    while len(s.workers) < len(ncores):
         yield gen.sleep(0.01)
         if time() - start > 5:
+            yield [w._close(timeout=1) for w in workers]
+            yield s.close(fast=True)
             raise Exception("Cluster creation timeout")
     raise gen.Return((s, workers))
 
@@ -534,12 +669,6 @@ def end_cluster(s, workers):
     def end_worker(w):
         with ignoring(TimeoutError, CommClosedError, EnvironmentError):
             yield w._close(report=False)
-        if isinstance(w, Nanny):
-            dir = w.worker_dir
-        else:
-            dir = w.local_dir
-        if dir and os.path.exists(dir):
-            shutil.rmtree(dir)
 
     yield [end_worker(w) for w in workers]
     yield s.close()  # wait until scheduler stops completely
@@ -567,16 +696,19 @@ def gen_cluster(ncores=[('127.0.0.1', 1), ('127.0.0.1', 2)],
         start
         end
     """
-    for name, level in logging_levels.items():
-        logging.getLogger(name).setLevel(level)
-
-    worker_kwargs = merge({'memory_limit': TOTAL_MEMORY}, worker_kwargs)
+    worker_kwargs = merge({'memory_limit': TOTAL_MEMORY, 'death_timeout': 5},
+                          worker_kwargs)
 
     def _(func):
         if not iscoroutinefunction(func):
             func = gen.coroutine(func)
 
         def test_func():
+            # Restore default logging levels
+            # XXX use pytest hooks/fixtures instead?
+            for name, level in logging_levels.items():
+                logging.getLogger(name).setLevel(level)
+
             old_globals = _globals.copy()
             result = None
             workers = []
@@ -585,10 +717,16 @@ def gen_cluster(ncores=[('127.0.0.1', 1), ('127.0.0.1', 2)],
                 with check_active_rpc(loop, active_rpc_timeout):
                     @gen.coroutine
                     def coro():
-                        s, ws = yield start_cluster(
-                            ncores, scheduler, loop, security=security,
-                            Worker=Worker, scheduler_kwargs=scheduler_kwargs,
-                            worker_kwargs=worker_kwargs)
+                        for i in range(5):
+                            try:
+                                s, ws = yield start_cluster(
+                                    ncores, scheduler, loop, security=security,
+                                    Worker=Worker, scheduler_kwargs=scheduler_kwargs,
+                                    worker_kwargs=worker_kwargs)
+                            except Exception:
+                                logger.error("Failed to start gen_cluster, retryng")
+                            else:
+                                break
                         workers[:] = ws
                         args = [s] + workers
                         if client:
@@ -597,8 +735,8 @@ def gen_cluster(ncores=[('127.0.0.1', 1), ('127.0.0.1', 2)],
                             args = [c] + args
                         try:
                             result = yield func(*args)
-                            # for w in workers:
-                            #     assert not w._comms
+                            if s.validate:
+                                s.validate_state()
                         finally:
                             if client:
                                 yield c._close()
@@ -619,27 +757,11 @@ def gen_cluster(ncores=[('127.0.0.1', 1), ('127.0.0.1', 2)],
                         # was already removed
                         pass
                     del w.data
+            DequeHandler.clear_all_instances()
             return result
 
         return test_func
     return _
-
-
-@contextmanager
-def make_hdfs():
-    from hdfs3 import HDFileSystem
-    # from .hdfs import DaskHDFileSystem
-    basedir = '/tmp/test-distributed'
-    hdfs = HDFileSystem(host='localhost', port=8020)
-    if hdfs.exists(basedir):
-        hdfs.rm(basedir)
-    hdfs.mkdir(basedir)
-
-    try:
-        yield hdfs, basedir
-    finally:
-        if hdfs.exists(basedir):
-            hdfs.rm(basedir)
 
 
 def raises(func, exc=Exception):
@@ -713,6 +835,27 @@ def wait_for_port(address, timeout=5):
         else:
             sock.close()
             break
+
+
+def wait_for(predicate, timeout, fail_func=None, period=0.001):
+    deadline = time() + timeout
+    while not predicate():
+        sleep(period)
+        if time() > deadline:
+            if fail_func is not None:
+                fail_func()
+            pytest.fail("condition not reached until %s seconds" % (timeout,))
+
+
+@gen.coroutine
+def async_wait_for(predicate, timeout, fail_func=None, period=0.001):
+    deadline = time() + timeout
+    while not predicate():
+        yield gen.sleep(period)
+        if time() > deadline:
+            if fail_func is not None:
+                fail_func()
+            pytest.fail("condition not reached until %s seconds" % (timeout,))
 
 
 @memoize
@@ -866,13 +1009,16 @@ def assert_can_connect_locally_6(port, timeout=None, connection_args=None):
 
 
 @contextmanager
-def captured_logger(logger, level=logging.INFO):
+def captured_logger(logger, level=logging.INFO, propagate=None):
     """Capture output from the given Logger.
     """
     if isinstance(logger, str):
         logger = logging.getLogger(logger)
     orig_level = logger.level
     orig_handlers = logger.handlers[:]
+    if propagate is not None:
+        orig_propagate = logger.propagate
+        logger.propagate = propagate
     sio = six.StringIO()
     logger.handlers[:] = [logging.StreamHandler(sio)]
     logger.setLevel(level)
@@ -881,6 +1027,8 @@ def captured_logger(logger, level=logging.INFO):
     finally:
         logger.handlers[:] = orig_handlers
         logger.setLevel(orig_level)
+        if propagate is not None:
+            logger.propagate = orig_propagate
 
 
 @contextmanager

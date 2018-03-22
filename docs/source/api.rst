@@ -34,6 +34,7 @@ API
    Client.run_on_scheduler
    Client.scatter
    Client.scheduler_info
+   Client.write_scheduler_file
    Client.set_metadata
    Client.start_ipython_workers
    Client.start_ipython_scheduler
@@ -77,9 +78,10 @@ API
 
 .. currentmodule:: distributed
 
-.. autosummary:: Lock
-.. autosummary:: Queue
-.. autosummary:: Variable
+.. autosummary::
+   Lock
+   Queue
+   Variable
 
 
 **Other**
@@ -89,6 +91,7 @@ API
    distributed.diagnostics.progress
    wait
    fire_and_forget
+   futures_of
 
 
 Asynchronous methods
@@ -148,6 +151,8 @@ Other
 .. autofunction:: as_completed
 .. autofunction:: distributed.diagnostics.progress
 .. autofunction:: wait
+.. autofunction:: fire_and_forget
+.. autofunction:: futures_of
 
 .. currentmodule:: distributed
 
@@ -157,6 +162,8 @@ Other
 .. autofunction:: distributed.secede
 .. autofunction:: distributed.rejoin
 
+.. autoclass:: Lock
+   :members:
 .. autoclass:: Queue
    :members:
 .. autoclass:: Variable

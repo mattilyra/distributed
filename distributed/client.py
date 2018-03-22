@@ -1,7 +1,7 @@
 from __future__ import print_function, division, absolute_import
 
 import atexit
-from collections import Iterator, Mapping, defaultdict
+from collections import Iterator, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures._base import DoneAndNotDoneFutures, CancelledError
 from contextlib import contextmanager
@@ -10,12 +10,12 @@ from datetime import timedelta
 import errno
 from functools import partial
 from glob import glob
+import itertools
 import json
 import logging
-from numbers import Number
+from numbers import Number, Integral
 import os
 import sys
-from time import sleep
 import uuid
 import threading
 import six
@@ -28,7 +28,14 @@ from dask.base import tokenize, normalize_token, collections_to_dsk
 from dask.core import flatten, get_dependencies
 from dask.compatibility import apply, unicode
 from dask.context import _globals
-from toolz import first, groupby, merge, valmap, keymap
+try:
+    from cytoolz import first, groupby, merge, valmap, keymap
+except ImportError:
+    from toolz import first, groupby, merge, valmap, keymap
+try:
+    from dask.delayed import single_key
+except ImportError:
+    single_key = first
 from tornado import gen
 from tornado.gen import TimeoutError
 from tornado.locks import Event, Condition
@@ -39,8 +46,8 @@ from .batched import BatchedSend
 from .utils_comm import (WrappedKey, unpack_remotedata, pack_data,
                          scatter_to_workers, gather_from_workers)
 from .cfexecutor import ClientExecutor
-from .compatibility import (Queue as pyQueue, Empty, isqueue,
-                            get_thread_identity, html_escape)
+from .compatibility import Queue as pyQueue, Empty, isqueue, html_escape
+from .config import config
 from .core import connect, rpc, clean_exception, CommClosedError
 from .metrics import time
 from .node import Node
@@ -120,7 +127,7 @@ class Future(WrappedKey):
         if tkey in self.client.futures:
             self._state = self.client.futures[tkey]
         else:
-            self._state = self.client.futures[tkey] = FutureState(Event())
+            self._state = self.client.futures[tkey] = FutureState()
 
         if inform:
             self.client._send_to_scheduler({'op': 'client-desires-keys',
@@ -143,19 +150,15 @@ class Future(WrappedKey):
     def status(self):
         return self._state.status
 
-    @property
-    def event(self):
-        return self._state.event
-
     def done(self):
         """ Is the computation complete? """
-        return self.event.is_set()
+        return self._state.done()
 
     def result(self, timeout=None):
         """ Wait until computation completes, gather result to local process.
 
-        If *timeout* seconds are elapsed before returning, a TimeoutError
-        is raised.
+        If *timeout* seconds are elapsed before returning, a
+        ``dask.distributed.TimeoutError`` is raised.
         """
         if self.client.asynchronous:
             return self.client.sync(self._result, callback_timeout=timeout)
@@ -172,7 +175,7 @@ class Future(WrappedKey):
 
     @gen.coroutine
     def _result(self, raiseit=True):
-        yield self._state.event.wait()
+        yield self._state.wait()
         if self.status == 'error':
             exc = clean_exception(self._state.exception,
                                   self._state.traceback)
@@ -192,7 +195,7 @@ class Future(WrappedKey):
 
     @gen.coroutine
     def _exception(self):
-        yield self.event.wait()
+        yield self._state.wait()
         if self.status == 'error':
             raise gen.Return(self._state.exception)
         else:
@@ -201,8 +204,8 @@ class Future(WrappedKey):
     def exception(self, timeout=None, **kwargs):
         """ Return the exception of a failed task
 
-        If *timeout* seconds are elapsed before returning, a TimeoutError
-        is raised.
+        If *timeout* seconds are elapsed before returning, a
+        ``dask.distributed.TimeoutError`` is raised.
 
         See Also
         --------
@@ -249,7 +252,7 @@ class Future(WrappedKey):
 
     @gen.coroutine
     def _traceback(self):
-        yield self.event.wait()
+        yield self._state.wait()
         if self.status == 'error':
             raise gen.Return(self._state.traceback)
         else:
@@ -262,8 +265,8 @@ class Future(WrappedKey):
         ``traceback`` module.  Alternatively if you call ``future.result()``
         this traceback will accompany the raised exception.
 
-        If *timeout* seconds are elapsed before returning, a TimeoutError
-        is raised.
+        If *timeout* seconds are elapsed before returning, a
+        ``dask.distributed.TimeoutError`` is raised.
 
         Examples
         --------
@@ -283,10 +286,12 @@ class Future(WrappedKey):
     def type(self):
         return self._state.type
 
-    def release(self):
+    def release(self, _in_destructor=False):
+        # NOTE: this method can be called from different threads
+        # (see e.g. Client.get() or Future.__del__())
         if not self._cleared and self.client.generation == self._generation:
             self._cleared = True
-            self.client._dec_ref(tokey(self.key))
+            self.client.loop.add_callback(self.client._dec_ref, tokey(self.key))
 
     def __getstate__(self):
         return (self.key, self.client.scheduler.address)
@@ -299,12 +304,10 @@ class Future(WrappedKey):
                               'keys': [tokey(self.key)], 'client': c.id})
 
     def __del__(self):
-        if not self._cleared and self.client.generation == self._generation:
-            self._cleared = True
-            try:
-                self.client.loop.add_callback(self.client._dec_ref, tokey(self.key))
-            except RuntimeError:  # closed event loop
-                pass
+        try:
+            self.release()
+        except RuntimeError:  # closed event loop
+            pass
 
     def __repr__(self):
         if self.type:
@@ -329,7 +332,7 @@ class Future(WrappedKey):
             except AttributeError:
                 typ = str(self.type)
             text += '<font color="gray">type: </font>%s, ' % typ
-        text += '<font color="gray">key: </font>%s' % html_escape(self.key)
+        text += '<font color="gray">key: </font>%s' % html_escape(str(self.key))
         return text
 
     def __await__(self):
@@ -341,32 +344,67 @@ class FutureState(object):
 
     This is shared between all Futures with the same key and client.
     """
-    __slots__ = ('event', 'status', 'type', 'exception', 'traceback')
+    __slots__ = ('_event', 'status', 'type', 'exception', 'traceback')
 
-    def __init__(self, event):
-        self.event = event
+    def __init__(self):
+        self._event = None
         self.status = 'pending'
         self.type = None
 
+    def _get_event(self):
+        # Can't create Event eagerly in constructor as it can fetch
+        # its IOLoop from the wrong thread
+        # (https://github.com/tornadoweb/tornado/issues/2189)
+        event = self._event
+        if event is None:
+            event = self._event = Event()
+        return event
+
     def cancel(self):
         self.status = 'cancelled'
-        self.event.set()
+        self._get_event().set()
 
     def finish(self, type=None):
         self.status = 'finished'
-        self.event.set()
+        self._get_event().set()
         if type is not None:
             self.type = type
 
     def lose(self):
         self.status = 'lost'
-        self.event.clear()
+        self._get_event().clear()
 
     def set_error(self, exception, traceback):
+        if isinstance(exception, bytes):
+            try:
+                exception = loads(exception)
+            except TypeError:
+                exception = Exception("Undeserializable exception", exception)
+        if traceback:
+            if isinstance(traceback, bytes):
+                try:
+                    traceback = loads(traceback)
+                except (TypeError, AttributeError):
+                    traceback = None
+        else:
+            traceback = None
+
         self.status = 'error'
         self.exception = exception
         self.traceback = traceback
-        self.event.set()
+        self._get_event().set()
+
+    def done(self):
+        return self._event is not None and self._event.is_set()
+
+    def reset(self):
+        self.status = 'pending'
+        if self._event is not None:
+            self._event.clear()
+
+    @gen.coroutine
+    def wait(self, timeout=None):
+        yield self._get_event().wait(timeout)
 
     def __repr__(self):
         return '<%s: %s>' % (self.__class__.__name__, self.status)
@@ -376,7 +414,7 @@ class FutureState(object):
 def done_callback(future, callback):
     """ Coroutine that waits on future, then calls callback """
     while future.status == 'pending':
-        yield future.event.wait()
+        yield future._state.wait()
     callback(future)
 
 
@@ -416,6 +454,8 @@ class Client(Node):
     name: string (optional)
         Gives the client a name that will be included in logs generated on
         the scheduler for matters relating to this client
+    heartbeat_interval: int
+        Time in milliseconds between heartbeats to scheduler
 
     Examples
     --------
@@ -443,16 +483,14 @@ class Client(Node):
     """
     def __init__(self, address=None, loop=None, timeout=5,
                  set_as_default=True, scheduler_file=None,
-                 security=None, start=None, asynchronous=False,
-                 name=None, **kwargs):
-        if start is not None:
-            raise ValueError("The start= keyword has been deprecated. "
-                             "Starting happens automatically. "
-                             "For asynchronous= use use the keyword instead")
+                 security=None, asynchronous=False,
+                 name=None, heartbeat_interval=None, **kwargs):
 
         self.futures = dict()
         self.refcount = defaultdict(lambda: 0)
         self.coroutines = []
+        if name is None and 'client-name' in config:
+            name = config['client-name']
         self.id = type(self).__name__ + ('-' + name + '-' if name else '-') + str(uuid.uuid1(clock_seq=os.getpid()))
         self.generation = 0
         self.status = 'newly-created'
@@ -460,6 +498,7 @@ class Client(Node):
         self.extensions = {}
         self.scheduler_file = scheduler_file
         self._startup_kwargs = kwargs
+        self.cluster = None
         self.scheduler = None
         self._scheduler_identity = {}
         self._lock = threading.Lock()
@@ -468,22 +507,37 @@ class Client(Node):
 
         # Communication
         self.security = security or Security()
+        self.scheduler_comm = None
         assert isinstance(self.security, Security)
         self.connection_args = self.security.get_connection_args('client')
         self._connecting_to_scheduler = False
         self._asynchronous = asynchronous
+        self._should_close_loop = not loop
         self._loop_runner = LoopRunner(loop=loop, asynchronous=asynchronous)
         self.loop = self._loop_runner.loop
 
-        self._periodic_callbacks = []
-        pc = PeriodicCallback(self._update_scheduler_info, 2000, io_loop=self.loop)
-        self._periodic_callbacks.append(pc)
+        self._periodic_callbacks = dict()
+        self._periodic_callbacks['scheduler-info'] = PeriodicCallback(
+                self._update_scheduler_info, 2000, io_loop=self.loop
+        )
+        self._periodic_callbacks['heartbeat'] = PeriodicCallback(
+                self._heartbeat,
+                heartbeat_interval or config.get('client-heartbeat-interval', 5000),
+                io_loop=self.loop
+        )
 
-        if hasattr(address, "scheduler_address"):
+        if address is None and 'scheduler-address' in config:
+            address = config['scheduler-address']
+            if address:
+                logger.info("Config value `scheduler-address` found: %s",
+                            address)
+
+        if isinstance(address, rpc):
+            self.scheduler = address
+        elif hasattr(address, "scheduler_address"):
             # It's a LocalCluster or LocalCluster-compatible object
             self.cluster = address
-        else:
-            self.cluster = None
+
         self._start_arg = address
         if set_as_default:
             self._previous_get = _globals.get('get')
@@ -565,7 +619,7 @@ class Client(Node):
             return '<%s: not connected>' % (self.__class__.__name__,)
 
     def _repr_html_(self):
-        if self._loop_runner.is_started():
+        if self._loop_runner.is_started() and self.scheduler:
             info = sync(self.loop, self.scheduler.identity)
         else:
             info = False
@@ -582,10 +636,10 @@ class Client(Node):
             protocol, rest = self.scheduler.address.split('://')
             port = info['services']['bokeh']
             if protocol == 'inproc':
-                address = 'http://localhost:%d' % port
+                address = 'http://localhost:%d/status' % port
             else:
                 host = rest.split(':')[0]
-                address = 'http://%s:%d' % (host, port)
+                address = 'http://%s:%d/status' % (host, port)
             text += "  <li><b>Dashboard: </b><a href='%(web)s' target='_blank'>%(web)s</a>\n" % {'web': address}
 
         text += "</ul>\n"
@@ -634,9 +688,6 @@ class Client(Node):
             self.scheduler_comm.send(msg)
         elif self.status in ('connecting', 'newly-created'):
             self._pending_msg_buffer.append(msg)
-        else:
-            raise Exception("Tried sending message after closing.  Status: %s\n"
-                            "Message: %s" % (self.status, msg))
 
     def _send_to_scheduler(self, msg):
         if self.status in ('running', 'closing', 'connecting', 'newly-created'):
@@ -685,19 +736,21 @@ class Client(Node):
                 yield self.cluster._start()
 
             # Wait for all workers to be ready
+            # XXX should be a LocalCluster method instead
             while (not self.cluster.workers or
-                   len(self.cluster.scheduler.ncores) < len(self.cluster.workers)):
+                   len(self.cluster.scheduler.workers) < len(self.cluster.workers)):
                 yield gen.sleep(0.01)
 
             address = self.cluster.scheduler_address
 
-        self.scheduler = rpc(address, timeout=timeout,
-                             connection_args=self.connection_args)
+        if self.scheduler is None:
+            self.scheduler = rpc(address, timeout=timeout,
+                                 connection_args=self.connection_args)
         self.scheduler_comm = None
 
         yield self._ensure_connected(timeout=timeout)
 
-        for pc in self._periodic_callbacks:
+        for pc in self._periodic_callbacks.values():
             pc.start()
 
         self.coroutines.append(self._handle_report())
@@ -725,7 +778,7 @@ class Client(Node):
     @gen.coroutine
     def _ensure_connected(self, timeout=None):
         if (self.scheduler_comm and not self.scheduler_comm.closed() or
-                self._connecting_to_scheduler):
+                self._connecting_to_scheduler or self.scheduler is None):
             return
 
         self._connecting_to_scheduler = True
@@ -758,7 +811,19 @@ class Client(Node):
 
     @gen.coroutine
     def _update_scheduler_info(self):
-        self._scheduler_identity = yield self.scheduler.identity()
+        if self.status not in ('running', 'connecting'):
+            return
+        try:
+            self._scheduler_identity = yield self.scheduler.identity()
+        except EnvironmentError:
+            if self.status not in ('running', 'connecting'):
+                return
+            else:
+                raise
+
+    def _heartbeat(self):
+        if self.scheduler_comm:
+            self.scheduler_comm.send({'op': 'heartbeat'})
 
     def __enter__(self):
         if not self._loop_runner.is_started():
@@ -806,41 +871,46 @@ class Client(Node):
     def _handle_report(self):
         """ Listen to scheduler """
         with log_errors():
-            while True:
-                try:
-                    msgs = yield self.scheduler_comm.comm.read()
-                except CommClosedError:
-                    if self.status == 'running':
-                        logger.warning("Client report stream closed to scheduler")
-                        logger.info("Reconnecting...")
-                        self.status = 'connecting'
-                        yield self._reconnect()
-                        continue
-                    else:
+            try:
+                while True:
+                    if self.scheduler_comm is None:
                         break
-                if not isinstance(msgs, list):
-                    msgs = [msgs]
-
-                breakout = False
-                for msg in msgs:
-                    logger.debug("Client receives message %s", msg)
-
-                    if 'status' in msg and 'error' in msg['status']:
-                        six.reraise(*clean_exception(**msg))
-
-                    op = msg.pop('op')
-
-                    if op == 'close' or op == 'stream-closed':
-                        breakout = True
-                        break
-
                     try:
-                        handler = self._handlers[op]
-                        handler(**msg)
-                    except Exception as e:
-                        logger.exception(e)
-                if breakout:
-                    break
+                        msgs = yield self.scheduler_comm.comm.read()
+                    except CommClosedError:
+                        if self.status == 'running':
+                            logger.warning("Client report stream closed to scheduler")
+                            logger.info("Reconnecting...")
+                            self.status = 'connecting'
+                            yield self._reconnect()
+                            continue
+                        else:
+                            break
+                    if not isinstance(msgs, list):
+                        msgs = [msgs]
+
+                    breakout = False
+                    for msg in msgs:
+                        logger.debug("Client receives message %s", msg)
+
+                        if 'status' in msg and 'error' in msg['status']:
+                            six.reraise(*clean_exception(**msg))
+
+                        op = msg.pop('op')
+
+                        if op == 'close' or op == 'stream-closed':
+                            breakout = True
+                            break
+
+                        try:
+                            handler = self._handlers[op]
+                            handler(**msg)
+                        except Exception as e:
+                            logger.exception(e)
+                    if breakout:
+                        break
+            except CancelledError:
+                pass
 
     def _handle_key_in_memory(self, key=None, type=None, workers=None):
         state = self.futures.get(key)
@@ -869,17 +939,6 @@ class Client(Node):
     def _handle_task_erred(self, key=None, exception=None, traceback=None):
         state = self.futures.get(key)
         if state is not None:
-            try:
-                exception = loads(exception)
-            except TypeError:
-                exception = Exception("Undeserializable exception", exception)
-            if traceback:
-                try:
-                    traceback = loads(traceback)
-                except AttributeError:
-                    traceback = None
-            else:
-                traceback = None
             state.set_error(exception, traceback)
 
     def _handle_restart(self):
@@ -897,8 +956,10 @@ class Client(Node):
     @gen.coroutine
     def _close(self, fast=False):
         """ Send close signal and wait until scheduler completes """
+        self.status = 'closing'
+
         with log_errors():
-            for pc in self._periodic_callbacks:
+            for pc in self._periodic_callbacks.values():
                 pc.stop()
             self._scheduler_identity = {}
             with ignoring(AttributeError):
@@ -910,25 +971,33 @@ class Client(Node):
             if self.status == 'closed':
                 raise gen.Return()
             if self.scheduler_comm and self.scheduler_comm.comm and not self.scheduler_comm.comm.closed():
-                for key in list(self.futures):
-                    self._release_key(key=key)
-                if self.status == 'running':
-                    self._send_to_scheduler({'op': 'close-stream'})
-            if self.scheduler_comm:
+                self._send_to_scheduler({'op': 'close-stream'})
                 yield self.scheduler_comm.close()
+            for key in list(self.futures):
+                self._release_key(key=key)
             if self._start_arg is None:
                 with ignoring(AttributeError):
                     yield self.cluster._close()
             self.status = 'closed'
             if _get_global_client() is self:
                 _set_global_client(None)
+            coroutines = set(self.coroutines)
+            for f in self.coroutines:
+                # cancel() works on asyncio futures (Tornado 5)
+                # but is a no-op on Tornado futures
+                f.cancel()
+                if f.cancelled():
+                    coroutines.remove(f)
+            del self.coroutines[:]
             if not fast:
                 with ignoring(TimeoutError):
-                    yield [gen.with_timeout(timedelta(seconds=2), f)
-                           for f in self.coroutines]
+                    yield gen.with_timeout(timedelta(seconds=2),
+                                           list(coroutines))
             with ignoring(AttributeError):
                 self.scheduler.close_rpc()
             self.scheduler = None
+
+        self.status = 'closed'
 
     _shutdown = _close
 
@@ -944,24 +1013,27 @@ class Client(Node):
         --------
         Client.restart
         """
+        # XXX handling of self.status here is not thread-safe
+        if self.status == 'closed':
+            return
+        self.status = 'closing'
+
         if self.asynchronous:
             future = self._close()
             if timeout:
                 future = gen.with_timeout(timedelta(seconds=timeout), future)
             return future
-        # XXX handling of self.status here is not thread-safe
-        if self.status == 'closed':
-            return
 
-        self.status = 'closing'
         if self._start_arg is None:
             with ignoring(AttributeError):
                 self.cluster.close()
 
         sync(self.loop, self._close, fast=True)
+
         assert self.status == 'closed'
 
-        self._loop_runner.stop()
+        if self._should_close_loop:
+            self._loop_runner.stop()
 
         with ignoring(AttributeError):
             dask.set_options(get=self._previous_get)
@@ -970,11 +1042,18 @@ class Client(Node):
         if self.get == _globals.get('get'):
             del _globals['get']
 
-    shutdown = close
+    def shutdown(self, *args, **kwargs):
+        """ Deprecated, see close instead
+
+        This was deprecated because "shutdown" was sometimes confusingly
+        thought to refer to the cluster rather than the client
+        """
+        warnings.warn("Shutdown is deprecated.  Please use close instead")
+        return self.close(*args, **kwargs)
 
     def get_executor(self, **kwargs):
-        """ Return a concurrent.futures Executor for submitting tasks
-        on this Client.
+        """
+        Return a concurrent.futures Executor for submitting tasks on this Client
 
         Parameters
         ----------
@@ -988,12 +1067,6 @@ class Client(Node):
         API.
         """
         return ClientExecutor(self, **kwargs)
-
-    def channel(self, *args, **kwargs):
-        """ Deprecated: see dask.distributed.Queue instead """
-        msg = ("Channels have been removed.  Consider using Queues instead. "
-               "http://distributed.readthedocs.io/en/latest/api.html#distributed.Queue")
-        raise NotImplementedError(msg)
 
     def submit(self, func, *args, **kwargs):
         """ Submit a function application to the scheduler
@@ -1014,6 +1087,11 @@ class Client(Node):
         allow_other_workers: bool (defaults to False)
             Used with `workers`. Inidicates whether or not the computations
             may be performed on workers that are not in the `workers` set(s).
+        retries: int (default to 0)
+            Number of allowed automatic retries if the task fails
+        priority: Number
+            Optional prioritization of task.  Zero is default.
+            Higher priorities take precedence
 
         Examples
         --------
@@ -1034,6 +1112,8 @@ class Client(Node):
         pure = kwargs.pop('pure', True)
         workers = kwargs.pop('workers', None)
         resources = kwargs.pop('resources', None)
+        retries = kwargs.pop('retries', None)
+        priority = kwargs.pop('priority', 0)
         allow_other_workers = kwargs.pop('allow_other_workers', False)
 
         if allow_other_workers not in (True, False, None):
@@ -1070,7 +1150,9 @@ class Client(Node):
 
         futures = self._graph_to_futures(dsk, [skey], restrictions,
                                          loose_restrictions, priority={skey: 0},
-                                         resources={skey: resources} if resources else None)
+                                         user_priority=priority,
+                                         resources={skey: resources} if resources else None,
+                                         retries={skey: retries} if retries else None)
 
         logger.debug("Submit %s(...), %s", funcname(func), key)
 
@@ -1111,6 +1193,11 @@ class Client(Node):
         workers: set, iterable of sets
             A set of worker hostnames on which computations may be performed.
             Leave empty to default to all workers (common case)
+        retries: int (default to 0)
+            Number of allowed automatic retries if a task fails
+        priority: Number
+            Optional prioritization of task.  Zero is default.
+            Higher priorities take precedence
 
         Examples
         --------
@@ -1147,7 +1234,9 @@ class Client(Node):
         key = key or funcname(func)
         pure = kwargs.pop('pure', True)
         workers = kwargs.pop('workers', None)
+        retries = kwargs.pop('retries', None)
         resources = kwargs.pop('resources', None)
+        user_priority = kwargs.pop('priority', 0)
         allow_other_workers = kwargs.pop('allow_other_workers', False)
 
         if allow_other_workers and workers is None:
@@ -1193,6 +1282,11 @@ class Client(Node):
         else:
             loose_restrictions = set()
 
+        if retries:
+            retries = {k: retries for k in keys}
+        else:
+            retries = None
+
         priority = dict(zip(keys, range(len(keys))))
 
         if resources:
@@ -1201,7 +1295,11 @@ class Client(Node):
             resources = None
 
         futures = self._graph_to_futures(dsk, keys, restrictions,
-                                         loose_restrictions, priority=priority, resources=resources)
+                                         loose_restrictions,
+                                         priority=priority,
+                                         resources=resources,
+                                         retries=retries,
+                                         user_priority=user_priority)
         logger.debug("map(%s, ...)", funcname(func))
 
         return [futures[tokey(k)] for k in keys]
@@ -1225,7 +1323,7 @@ class Client(Node):
         def wait(k):
             """ Want to stop the All(...) early if we find an error """
             st = self.futures[k]
-            yield st.event.wait()
+            yield st.wait()
             if st.status != 'finished':
                 raise AllExit()
 
@@ -1292,7 +1390,7 @@ class Client(Node):
                     self._send_to_scheduler({'op': 'report-key',
                                              'key': key})
                 for key in response['keys']:
-                    self.futures[key].event.clear()
+                    self.futures[key].reset()
             else:
                 break
 
@@ -1734,7 +1832,7 @@ class Client(Node):
         --------
 
         >>> def get_number_of_tasks(dask_scheduler=None):
-        ...     return len(dask_scheduler.task_state)
+        ...     return len(dask_scheduler.tasks)
 
         >>> client.run_on_scheduler(get_number_of_tasks)  # doctest: +SKIP
         100
@@ -1854,8 +1952,8 @@ class Client(Node):
         return self.sync(self._run_coroutine, function, *args, **kwargs)
 
     def _graph_to_futures(self, dsk, keys, restrictions=None,
-                          loose_restrictions=None, allow_other_workers=True, priority=None,
-                          resources=None):
+                          loose_restrictions=None, priority=None,
+                          user_priority=0, resources=None, retries=None):
         with self._lock:
             keyset = set(keys)
             flatkeys = list(map(tokey, keys))
@@ -1864,7 +1962,7 @@ class Client(Node):
             values = {k for k, v in dsk.items() if isinstance(v, Future)
                       and k not in keyset}
             if values:
-                dsk = dask.optimize.inline(dsk, keys=values)
+                dsk = dask.optimization.inline(dsk, keys=values)
 
             d = {k: unpack_remotedata(v) for k, v in dsk.items()}
             extra_keys = set.union(*[v[1] for v in d.values()]) if d else set()
@@ -1900,8 +1998,11 @@ class Client(Node):
                                      'restrictions': restrictions or {},
                                      'loose_restrictions': loose_restrictions,
                                      'priority': priority,
+                                     'user_priority': user_priority,
                                      'resources': resources,
-                                     'submitting_task': getattr(thread_state, 'key', None)})
+                                     'submitting_task': getattr(thread_state, 'key', None),
+                                     'retries': retries,
+                                     })
             return futures
 
     def get(self, dsk, keys, restrictions=None, loose_restrictions=None,
@@ -1965,7 +2066,7 @@ class Client(Node):
                 dsk[key] = Future(key, self, inform=False)
 
         if changed:
-            dsk, _ = dask.optimize.cull(dsk, keys)
+            dsk, _ = dask.optimization.cull(dsk, keys)
 
         return dsk
 
@@ -2004,7 +2105,7 @@ class Client(Node):
 
     def compute(self, collections, sync=False, optimize_graph=True,
                 workers=None, allow_other_workers=False, resources=None,
-                **kwargs):
+                retries=0, priority=0, **kwargs):
         """ Compute dask collections on cluster
 
         Parameters
@@ -2024,6 +2125,11 @@ class Client(Node):
         allow_other_workers: bool, list
             If True then all restrictions in workers= are considered loose
             If a list then only the keys for the listed collections are loose
+        retries: int (default to 0)
+            Number of allowed automatic retries if computing a result fails
+        priority: Number
+            Optional prioritization of task.  Zero is default.
+            Higher priorities take precedence
         **kwargs:
             Options to pass to the graph optimize calls
 
@@ -2070,19 +2176,36 @@ class Client(Node):
         dsk = self.collections_to_dsk(variables, optimize_graph, **kwargs)
         names = ['finalize-%s' % tokenize(v) for v in variables]
         dsk2 = {}
-        for name, v in zip(names, variables):
+        for i, (name, v) in enumerate(zip(names, variables)):
             func, extra_args = v.__dask_postcompute__()
-            dsk2[name] = (func, v.__dask_keys__()) + extra_args
+            keys = v.__dask_keys__()
+            if func is single_key and len(keys) == 1 and not extra_args:
+                names[i] = keys[0]
+            else:
+                dsk2[name] = (func, keys) + extra_args
 
         restrictions, loose_restrictions = self.get_restrictions(collections,
                                                                  workers, allow_other_workers)
 
         if resources:
-            resources = self.expand_resources(resources)
+            resources = self._expand_resources(resources,
+                                               all_keys=itertools.chain(dsk, dsk2))
+
+        if retries:
+            retries = self._expand_retries(retries,
+                                           all_keys=itertools.chain(dsk, dsk2))
+        else:
+            retries = None
+
+        if not isinstance(priority, Number):
+            priority = {k: p for c, p in priority.items()
+                             for k in self._expand_key(c)}
 
         futures_dict = self._graph_to_futures(merge(dsk2, dsk), names,
                                               restrictions, loose_restrictions,
-                                              resources=resources)
+                                              resources=resources,
+                                              retries=retries,
+                                              user_priority=priority)
 
         i = 0
         futures = []
@@ -2104,7 +2227,8 @@ class Client(Node):
             return result
 
     def persist(self, collections, optimize_graph=True, workers=None,
-                allow_other_workers=None, resources=None, **kwargs):
+                allow_other_workers=None, resources=None, retries=None,
+                priority=0, **kwargs):
         """ Persist dask collections on cluster
 
         Starts computation of the collection on the cluster in the background.
@@ -2126,6 +2250,11 @@ class Client(Node):
         allow_other_workers: bool, list
             If True then all restrictions in workers= are considered loose
             If a list then only the keys for the listed collections are loose
+        retries: int (default to 0)
+            Number of allowed automatic retries if computing a result fails
+        priority: Number
+            Optional prioritization of task.  Zero is default.
+            Higher priorities take precedence
         kwargs:
             Options to pass to the graph optimize calls
 
@@ -2158,10 +2287,24 @@ class Client(Node):
                                                                  workers, allow_other_workers)
 
         if resources:
-            resources = self.expand_resources(resources)
+            resources = self._expand_resources(resources,
+                                               all_keys=itertools.chain(dsk, names))
+
+        if retries:
+            retries = self._expand_retries(retries,
+                                           all_keys=itertools.chain(dsk, names))
+        else:
+            retries = None
+
+        if not isinstance(priority, Number):
+            priority = {k: p for c, p in priority.items()
+                             for k in self._expand_key(c)}
 
         futures = self._graph_to_futures(dsk, names, restrictions,
-                                         loose_restrictions, resources=resources)
+                                         loose_restrictions,
+                                         resources=resources,
+                                         retries=retries,
+                                         user_priority=priority)
 
         postpersists = [c.__dask_postpersist__() for c in collections]
         result = [func({k: futures[k] for k in flatten(c.__dask_keys__())}, *args)
@@ -2624,6 +2767,33 @@ class Client(Node):
         self.sync(self._update_scheduler_info)
         return self._scheduler_identity
 
+    def write_scheduler_file(self, scheduler_file):
+        """ Write the scheduler information to a json file.
+
+        This facilitates easy sharing of scheduler information using a file
+        system. The scheduler file can be used to instantiate a second Client
+        using the same scheduler.
+
+        Parameter
+        ---------
+        scheduler_file: str
+            Path to a write the scheduler file.
+
+        Examples
+        --------
+        >>> client = Client()
+        >>> client.write_scheduler_file('scheduler.json')
+        # connect to previous client's scheduler
+        >>> client2 = Client(scheduler_file='scheduler.json')
+        """
+        if self.scheduler_file:
+            raise ValueError('Scheduler file already set')
+        else:
+            self.scheduler_file = scheduler_file
+
+        with open(self.scheduler_file, 'w') as f:
+            json.dump(self.scheduler_info(), f, indent=2)
+
     def get_metadata(self, keys, default=no_default):
         """ Get arbitrary metadata from scheduler
 
@@ -2746,12 +2916,13 @@ class Client(Node):
         except KeyError:
             scheduler = None
 
-        workers = sync(self.loop, self._run, get_versions)
+        workers = sync(self.loop, self.scheduler.broadcast, msg={'op': 'versions'})
         result = {'scheduler': scheduler, 'workers': workers, 'client': client}
 
         if check:
             # we care about the required & optional packages matching
-            def to_packages(d): return merge(d['packages'].values())
+            def to_packages(d):
+                return dict(sum(d['packages'].values(), []))
             client_versions = to_packages(result['client'])
             versions = [('scheduler', to_packages(result['scheduler']))]
             versions.extend((w, to_packages(d))
@@ -2928,23 +3099,70 @@ class Client(Node):
                               extra_args=qtconsole_args,)
         return info
 
-    @staticmethod
-    def expand_resources(resources):
-        assert isinstance(resources, dict)
-        out = {}
-        for k, v in resources.items():
-            if not isinstance(k, tuple):
-                k = (k,)
-            for kk in k:
-                if dask.is_dask_collection(kk):
-                    for kkk in kk.__dask_keys__():
-                        out[tokey(kkk)] = v
-                else:
-                    out[tokey(kk)] = v
-        return out
+    @classmethod
+    def _expand_key(cls, k):
+        """
+        Expand a user-provided task key specification, e.g. in a resources
+        or retries dictionary.
+        """
+        if not isinstance(k, tuple):
+            k = (k,)
+        for kk in k:
+            if dask.is_dask_collection(kk):
+                for kkk in kk.__dask_keys__():
+                    yield tokey(kkk)
+            else:
+                yield tokey(kk)
 
-    @staticmethod
-    def get_restrictions(collections, workers, allow_other_workers):
+    @classmethod
+    def _expand_retries(cls, retries, all_keys):
+        """
+        Expand the user-provided "retries" specification
+        to a {task key: Integral} dictionary.
+        """
+        if retries and isinstance(retries, dict):
+            result = {name: value
+                      for key, value in retries.items()
+                      for name in cls._expand_key(key)}
+        elif isinstance(retries, Integral):
+            # Each task unit may potentially fail, allow retrying all of them
+            result = {name: retries for name in all_keys}
+        else:
+            raise TypeError("`retries` should be an integer or dict, got %r"
+                            % (type(retries,)))
+        return keymap(tokey, result)
+
+    def _expand_resources(cls, resources, all_keys):
+        """
+        Expand the user-provided "resources" specification
+        to a {task key: {resource name: Number}} dictionary.
+        """
+        # Resources can either be a single dict such as {'GPU': 2},
+        # indicating a requirement for all keys, or a nested dict
+        # such as {'x': {'GPU': 1}, 'y': {'SSD': 4}} indicating
+        # per-key requirements
+        if not isinstance(resources, dict):
+            raise TypeError("`resources` should be a dict, got %r"
+                            % (type(resources,)))
+
+        per_key_reqs = {}
+        global_reqs = {}
+        all_keys = list(all_keys)
+        for k, v in resources.items():
+            if isinstance(v, dict):
+                # It's a per-key requirement
+                per_key_reqs.update((kk, v) for kk in cls._expand_key(k))
+            else:
+                # It's a global requirement
+                global_reqs.update((kk, {k: v}) for kk in all_keys)
+
+        if global_reqs and per_key_reqs:
+            raise ValueError("cannot have both per-key and all-key requirements "
+                             "in resources dict %r" % (resources,))
+        return global_reqs or per_key_reqs
+
+    @classmethod
+    def get_restrictions(cls, collections, workers, allow_other_workers):
         """ Get restrictions from inputs to compute/persist """
         if isinstance(workers, (str, tuple, list)):
             workers = {tuple(collections): workers}
@@ -2998,7 +3216,7 @@ def _wait(fs, timeout=None, return_when='ALL_COMPLETED'):
                         "  Good: wait([x, y, z])")
     fs = futures_of(fs)
     if return_when == 'ALL_COMPLETED':
-        future = All({f.event.wait() for f in fs})
+        future = All({f._state.wait() for f in fs})
         if timeout is not None:
             future = gen.with_timeout(timedelta(seconds=timeout), future)
         yield future
@@ -3023,9 +3241,7 @@ def wait(fs, timeout=None, return_when='ALL_COMPLETED'):
     ----------
     fs: list of futures
     timeout: number, optional
-        Time in seconds after which to raise a gen.TimeoutError
-
-    Returns
+        Time in seconds after which to raise a ``dask.distributed.TimeoutError``
     -------
     Named tuple of completed, not completed
     """
@@ -3039,7 +3255,7 @@ def _as_completed(fs, queue):
     fs = futures_of(fs)
     groups = groupby(lambda f: f.key, fs)
     firsts = [v[0] for v in groups.values()]
-    wait_iterator = gen.WaitIterator(*[f.event.wait() for f in firsts])
+    wait_iterator = gen.WaitIterator(*[f._state.wait() for f in firsts])
 
     while not wait_iterator.done():
         yield wait_iterator.next()
@@ -3188,10 +3404,10 @@ class as_completed(object):
     @gen.coroutine
     def __anext__(self):
         if not self.futures and self.queue.empty():
-            raise StopAsyncIteration  # flake8: noqa
+            raise StopAsyncIteration
         while self.queue.empty():
             if not self.futures:
-                raise StopAsyncIteration  # flake8: noqa
+                raise StopAsyncIteration
             yield self.condition.wait()
 
         raise gen.Return(self.queue.get())

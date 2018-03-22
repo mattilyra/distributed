@@ -21,6 +21,7 @@ from tornado.ioloop import TimeoutError
 from distributed import (Nanny, Client, get_client, wait, default_client,
         get_worker, Reschedule)
 from distributed.compatibility import WINDOWS
+from distributed.config import config
 from distributed.core import rpc
 from distributed.client import wait
 from distributed.scheduler import Scheduler
@@ -30,7 +31,7 @@ from distributed.utils import tmpfile
 from distributed.utils_test import (inc, mul, gen_cluster, div, dec,
                                     slow, slowinc, gen_test, cluster,
                                     captured_logger)
-from distributed.utils_test import loop # flake8: noqa
+from distributed.utils_test import loop, nodebug # noqa: F401
 
 
 def test_worker_ncores():
@@ -58,27 +59,6 @@ def test_identity():
     assert ident['scheduler'] == 'tcp://127.0.0.1:8019'
     assert isinstance(ident['ncores'], int)
     assert isinstance(ident['memory_limit'], Number)
-
-
-def test_health():
-    w = Worker('127.0.0.1', 8019)
-    d = w.host_health()
-    assert isinstance(d, dict)
-    d = w.host_health()
-    try:
-        import psutil
-    except ImportError:
-        pass
-    else:
-        try:
-            psutil.disk_io_counters()
-        except RuntimeError:
-            pass
-        else:
-            assert 'disk-read' in d
-            assert 'disk-write' in d
-        assert 'network-recv' in d
-        assert 'network-send' in d
 
 
 @gen_cluster(client=True)
@@ -714,13 +694,13 @@ def test_priorities_2(c, s, w):
     assert any(key.startswith('b1') for key in log[:len(log) // 2])
 
 
-@gen_cluster(client=True, worker_kwargs={'heartbeat_interval': 0.020})
+@gen_cluster(client=True)
 def test_heartbeats(c, s, a, b):
-    pytest.importorskip('psutil')
-    start = time()
-    while not all(s.worker_info[w].get('memory-rss') for w in s.workers):
-        yield gen.sleep(0.01)
-        assert time() < start + 2
+    x = s.worker_info[a.address]['last-seen']
+    yield gen.sleep(a.periodic_callbacks['heartbeat'].callback_time / 1000 + 0.1)
+    y = s.worker_info[a.address]['last-seen']
+    assert x != y
+    assert a.periodic_callbacks['heartbeat'].callback_time < 1000
 
 
 @pytest.mark.parametrize('worker', [Worker, Nanny])
@@ -929,18 +909,17 @@ def test_scheduler_file():
         s.start(8009)
         w = Worker(scheduler_file=fn)
         yield w._start()
-        assert s.workers == {w.address}
+        assert set(s.workers) == {w.address}
         yield w._close()
         s.stop()
 
 
-@gen_cluster(client=True, worker_kwargs={'heartbeat_interval': 50})
+@gen_cluster(client=True)
 def test_scheduler_delay(c, s, a, b):
     old = a.scheduler_delay
-    assert abs(a.scheduler_delay) < 0.01
-    assert abs(b.scheduler_delay) < 0.01
-
-    yield gen.sleep(0.100)
+    assert abs(a.scheduler_delay) < 0.1
+    assert abs(b.scheduler_delay) < 0.1
+    yield gen.sleep(a.periodic_callbacks['heartbeat'].callback_time / 1000 + .3)
     assert a.scheduler_delay != old
 
 
@@ -953,6 +932,7 @@ def test_statistical_profiling(c, s, a, b):
     assert profile['count']
 
 
+@nodebug
 @gen_cluster(client=True)
 def test_statistical_profiling_2(c, s, a, b):
     da = pytest.importorskip('dask.array')
@@ -1024,6 +1004,7 @@ def test_statistical_profiling_cycle(c, s, a, b):
     futures = c.map(slowinc, range(20), delay=0.05)
     yield wait(futures)
     yield gen.sleep(0.01)
+    end = time()
     assert len(a.profile_history) > 3
 
     x = a.get_profile(start=time() + 10, stop=time() + 20)
@@ -1032,8 +1013,8 @@ def test_statistical_profiling_cycle(c, s, a, b):
     x = a.get_profile(start=0, stop=time())
     assert x['count'] == sum(p['count'] for _, p in a.profile_history) + a.profile_recent['count']
 
-    y = a.get_profile(start=time() - 0.300, stop=time())
-    assert 0 < y['count'] < x['count']
+    y = a.get_profile(start=end - 0.300, stop=time())
+    assert 0 < y['count'] <= x['count']
 
 
 @gen_cluster(client=True)
@@ -1050,6 +1031,7 @@ def test_get_current_task(c, s, a, b):
 def test_reschedule(c, s, a, b):
     s.extensions['stealing']._pc.stop()
     a_address = a.address
+
     def f(x):
         sleep(0.1)
         if get_worker().address == a_address:
@@ -1063,9 +1045,63 @@ def test_reschedule(c, s, a, b):
 
 
 def test_deque_handler():
-    from distributed.worker import deque_handler, logger
+    from distributed.worker import logger
+    w = Worker('127.0.0.1', 8019)
+    deque_handler = w._deque_handler
     logger.info('foo456')
     assert deque_handler.deque
     msg = deque_handler.deque[-1]
     assert 'distributed.worker' in deque_handler.format(msg)
     assert any(msg.msg == 'foo456' for msg in deque_handler.deque)
+
+
+@gen_cluster(ncores=[], client=True)
+def test_avoid_memory_monitor_if_zero_limit(c, s):
+    worker = Worker(s.address, loop=s.loop, memory_limit=0,
+                    memory_monitor_interval=10)
+    yield worker._start()
+    assert type(worker.data) is dict
+    assert 'memory' not in worker.periodic_callbacks
+
+    future = c.submit(inc, 1)
+    assert (yield future) == 2
+    yield gen.sleep(worker.memory_monitor_interval / 1000)
+
+    yield c.submit(inc, 2)  # worker doesn't pause
+
+    yield worker._close()
+
+
+def test_get_worker_name(loop):
+    with cluster() as (s, [a, b]):
+        with Client(s['address'], loop=loop) as c:
+            def f():
+                get_client().submit(inc, 1).result()
+
+            c.run(f)
+
+            def func(dask_scheduler):
+                return list(dask_scheduler.clients)
+
+            start = time()
+            while not any('worker' in n for n in c.run_on_scheduler(func)):
+                sleep(0.1)
+                assert time() < start + 10
+
+
+@gen_cluster(ncores=[('127.0.0.1', 1)],
+        worker_kwargs={'memory_limit': '2e3 MB'})
+def test_parse_memory_limit(s, w):
+    assert w.memory_limit == 2e9
+
+
+@gen_cluster(ncores=[], client=True)
+def test_scheduler_address_config(c, s):
+    config['scheduler-address'] = s.address
+    try:
+        worker = Worker(loop=s.loop)
+        yield worker._start()
+        assert worker.scheduler.address == s.address
+    finally:
+        del config['scheduler-address']
+    yield worker._close()

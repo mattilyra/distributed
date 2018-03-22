@@ -8,10 +8,9 @@ import logging
 import os
 from pickle import PicklingError
 import random
-import tempfile
 import threading
-import shutil
 import sys
+import warnings
 import weakref
 
 from dask.core import istask
@@ -30,12 +29,14 @@ from .batched import BatchedSend
 from .comm import get_address_host, get_local_address_for
 from .comm.utils import offload
 from .config import config, log_format
-from .compatibility import unicode, get_thread_identity
+from .compatibility import unicode, get_thread_identity, finalize
 from .core import (error_message, CommClosedError,
                    rpc, pingpong, coerce_to_address)
+from .diskutils import WorkSpace
 from .metrics import time
 from .node import ServerNode
 from .preloading import preload_modules
+from .proctitle import setproctitle
 from .protocol import (pickle, to_serialize, deserialize_bytes,
                        serialize_bytelist)
 from .security import Security
@@ -44,15 +45,14 @@ from .threadpoolexecutor import ThreadPoolExecutor, secede as tpe_secede
 from .utils import (funcname, get_ip, has_arg, _maybe_complex, log_errors,
                     ignoring, validate_key, mp_context, import_file,
                     silence_logging, thread_state, json_load_robust, key_split,
-                    format_bytes, DequeHandler, ThrottledGC, PeriodicCallback)
+                    format_bytes, DequeHandler, PeriodicCallback,
+                    parse_bytes)
 from .utils_comm import pack_data, gather_from_workers
+from .utils_perf import ThrottledGC, enable_gc_diagnosis, disable_gc_diagnosis
 
 _ncores = mp_context.cpu_count()
 
 logger = logging.getLogger(__name__)
-deque_handler = DequeHandler(n=config.get('log-length', 10000))
-deque_handler.setFormatter(logging.Formatter(log_format))
-logger.addHandler(deque_handler)
 
 LOG_PDB = config.get('pdb-on-err')
 
@@ -80,13 +80,18 @@ class WorkerBase(ServerNode):
     def __init__(self, scheduler_ip=None, scheduler_port=None,
                  scheduler_file=None, ncores=None, loop=None, local_dir=None,
                  services=None, service_ports=None, name=None,
-                 heartbeat_interval=5000, reconnect=True, memory_limit='auto',
+                 reconnect=True, memory_limit='auto',
                  executor=None, resources=None, silence_logs=None,
-                 death_timeout=None, preload=(), security=None,
+                 death_timeout=None, preload=(), preload_argv=[], security=None,
                  contact_address=None, memory_monitor_interval=200, **kwargs):
+
+        self._setup_logging()
+
         if scheduler_file:
             cfg = json_load_robust(scheduler_file)
             scheduler_addr = cfg['address']
+        elif scheduler_ip is None and config.get('scheduler-address'):
+            scheduler_addr = config['scheduler-address']
         elif scheduler_port is None:
             scheduler_addr = coerce_to_address(scheduler_ip)
         else:
@@ -97,6 +102,7 @@ class WorkerBase(ServerNode):
         self.available_resources = (resources or {}).copy()
         self.death_timeout = death_timeout
         self.preload = preload
+        self.preload_argv = preload_argv,
         self.contact_address = contact_address
         self.memory_monitor_interval = memory_monitor_interval
         if silence_logs:
@@ -104,22 +110,19 @@ class WorkerBase(ServerNode):
 
         if local_dir:
             local_dir = os.path.abspath(local_dir)
-            if not os.path.exists(local_dir):
-                os.mkdir(local_dir)
-        self.local_dir = tempfile.mkdtemp(prefix='worker-', dir=local_dir)
+        else:
+            local_dir = 'dask-worker-space'
+        self._workspace = WorkSpace(local_dir)
+        self._workdir = self._workspace.new_work_dir(prefix='worker-')
+        self.local_dir = self._workdir.dir_path
 
         self.security = security or Security()
         assert isinstance(self.security, Security)
         self.connection_args = self.security.get_connection_args('worker')
         self.listen_args = self.security.get_listen_args('worker')
 
-        if memory_limit == 'auto':
-            memory_limit = int(TOTAL_MEMORY * min(1, self.ncores / _ncores))
-        with ignoring(TypeError):
-            memory_limit = float(memory_limit)
-        if isinstance(memory_limit, float) and memory_limit <= 1:
-            memory_limit = memory_limit * TOTAL_MEMORY
-        self.memory_limit = memory_limit
+        self.memory_limit = parse_memory_limit(memory_limit, self.ncores)
+
         self.paused = False
 
         if 'memory_target_fraction' in kwargs:
@@ -154,13 +157,10 @@ class WorkerBase(ServerNode):
         self.scheduler = rpc(scheduler_addr, connection_args=self.connection_args)
         self.name = name
         self.scheduler_delay = 0
-        self.heartbeat_interval = heartbeat_interval
         self.heartbeat_active = False
         self.execution_state = {'scheduler': self.scheduler.address,
                                 'ioloop': self.loop,
                                 'worker': self}
-        self._last_disk_io = None
-        self._last_net_io = None
         self._ipython_kernel = None
 
         if self.local_dir not in sys.path:
@@ -180,7 +180,6 @@ class WorkerBase(ServerNode):
             'delete_data': self.delete_data,
             'terminate': self.terminate,
             'ping': pingpong,
-            'health': self.host_health,
             'upload_file': self.upload_file,
             'start_ipython': self.start_ipython,
             'call_stack': self.get_call_stack,
@@ -188,22 +187,33 @@ class WorkerBase(ServerNode):
             'profile_metadata': self.get_profile_metadata,
             'get_logs': self.get_logs,
             'keys': self.keys,
+            'versions': self.versions,
         }
 
         super(WorkerBase, self).__init__(handlers, io_loop=self.loop,
                                          connection_args=self.connection_args,
                                          **kwargs)
 
-        pc = PeriodicCallback(self.heartbeat,
-                              self.heartbeat_interval)
+        pc = PeriodicCallback(self.heartbeat, 1000, io_loop=self.io_loop)
         self.periodic_callbacks['heartbeat'] = pc
         self._address = contact_address
 
-        self._memory_monitoring = False
-        pc = PeriodicCallback(self.memory_monitor,
-                              self.memory_monitor_interval)
-        self.periodic_callbacks['memory'] = pc
+        if self.memory_limit:
+            self._memory_monitoring = False
+            pc = PeriodicCallback(self.memory_monitor,
+                                  self.memory_monitor_interval,
+                                  io_loop=self.io_loop)
+            self.periodic_callbacks['memory'] = pc
+
         self._throttled_gc = ThrottledGC(logger=logger)
+
+        setproctitle("dask-worker [not started]")
+
+    def _setup_logging(self):
+        self._deque_handler = DequeHandler(n=config.get('log-length', 10000))
+        self._deque_handler.setFormatter(logging.Formatter(log_format))
+        logger.addHandler(self._deque_handler)
+        finalize(self, logger.removeHandler, self._deque_handler)
 
     @property
     def worker_address(self):
@@ -216,31 +226,23 @@ class WorkerBase(ServerNode):
             self.heartbeat_active = True
             logger.debug("Heartbeat: %s" % self.address)
             try:
-                if psutil:
-                    memory_info = psutil.Process().memory_info()
-                    kwargs = {'memory': memory_info.vms,
-                              'memory-vms': memory_info.vms,
-                              'memory-rss': memory_info.rss}
-                else:
-                    kwargs = {}
-
                 start = time()
                 response = yield self.scheduler.register(
                     address=self.contact_address,
                     name=self.name,
                     ncores=self.ncores,
                     now=time(),
-                    host_info=self.host_health(),
                     services=self.service_ports,
                     memory_limit=self.memory_limit,
                     executing=len(self.executing),
                     in_memory=len(self.data),
                     ready=len(self.ready),
                     in_flight=len(self.in_flight_tasks),
-                    **kwargs)
+                    **self.monitor.recent())
                 end = time()
                 middle = (start + end) / 2
                 self.scheduler_delay = response['time'] - middle
+                self.periodic_callbacks['heartbeat'].callback_time = response['heartbeat-interval'] * 1000
             finally:
                 self.heartbeat_active = False
         else:
@@ -252,6 +254,7 @@ class WorkerBase(ServerNode):
         start = time()
         if self.contact_address is None:
             self.contact_address = self.address
+        logger.info('-' * 49)
         while True:
             if self.death_timeout and time() > start + self.death_timeout:
                 yield self._close(timeout=1)
@@ -267,14 +270,16 @@ class WorkerBase(ServerNode):
                         name=self.name,
                         nbytes=self.nbytes,
                         now=time(),
-                        host_info=self.host_health(),
                         services=self.service_ports,
                         memory_limit=self.memory_limit,
                         local_directory=self.local_dir,
                         resources=self.total_resources,
-                        pid=os.getpid())
+                        pid=os.getpid(),
+                        **self.monitor.recent())
                 if self.death_timeout:
                     diff = self.death_timeout - (time() - start)
+                    if diff < 0:
+                        continue
                     future = gen.with_timeout(timedelta(seconds=diff), future)
                 response = yield future
                 _end = time()
@@ -283,14 +288,16 @@ class WorkerBase(ServerNode):
                 self.status = 'running'
                 break
             except EnvironmentError:
-                logger.info("Trying to connect to scheduler: %s" %
-                            str(self.scheduler.address))
+                logger.info('Waiting to connect to: %26s', self.scheduler.address)
                 yield gen.sleep(0.1)
             except gen.TimeoutError:
-                pass
+                logger.info("Timed out when connecting to scheduler")
         if response['status'] != 'OK':
             raise ValueError("Unexpected response from register: %r" %
                              (response,))
+        else:
+            logger.info('        Registered to: %26s', self.scheduler.address)
+            logger.info('-' * 49)
         self.periodic_callbacks['heartbeat'].start()
 
     def start_services(self, listen_ip=''):
@@ -311,6 +318,8 @@ class WorkerBase(ServerNode):
     @gen.coroutine
     def _start(self, addr_or_port=0):
         assert self.status is None
+
+        enable_gc_diagnosis()
 
         # XXX Factor this out
         if not addr_or_port:
@@ -338,7 +347,7 @@ class WorkerBase(ServerNode):
             protocol, listen_host = listen_host.split('://')
 
         self.name = self.name or self.address
-        preload_modules(self.preload, parameter=self, file_dir=self.local_dir)
+        preload_modules(self.preload, parameter=self, file_dir=self.local_dir, argv=self.preload_argv)
         # Services listen on all addresses
         # Note Nanny is not a "real" service, just some metadata
         # passed in service_ports...
@@ -359,16 +368,12 @@ class WorkerBase(ServerNode):
         if self.memory_limit:
             logger.info('               Memory: %26s', format_bytes(self.memory_limit))
         logger.info('      Local Directory: %26s', self.local_dir)
-        logger.info('-' * 49)
+
+        setproctitle("dask-worker [%s]" % self.address)
 
         yield self._register_with_scheduler()
 
-        if self.status == 'running':
-            logger.info('        Registered to: %26s', self.scheduler.address)
-            logger.info('-' * 49)
-
-        for pc in self.periodic_callbacks.values():
-            pc.start()
+        self.start_periodic_callbacks()
 
     def start(self, port=0):
         self.loop.add_callback(self._start, port)
@@ -381,11 +386,16 @@ class WorkerBase(ServerNode):
                 'memory_limit': self.memory_limit}
 
     @gen.coroutine
-    def _close(self, report=True, timeout=10, nanny=True):
+    def _close(self, report=True, timeout=10, nanny=True, executor_wait=True):
         if self.status in ('closed', 'closing'):
             return
+
+        disable_gc_diagnosis()
+
         logger.info("Stopping worker at %s", self.address)
         self.status = 'closing'
+        setproctitle("dask-worker [closing]")
+
         self.stop()
         for pc in self.periodic_callbacks.values():
             pc.stop()
@@ -395,11 +405,10 @@ class WorkerBase(ServerNode):
                                        self.scheduler.unregister(address=self.contact_address))
         self.scheduler.close_rpc()
         if isinstance(self.executor, ThreadPoolExecutor):
-            self.executor.shutdown(timeout=timeout)
+            self.executor.shutdown(wait=executor_wait, timeout=timeout)
         else:
             self.executor.shutdown(wait=False)
-        if os.path.exists(self.local_dir):
-            shutil.rmtree(self.local_dir)
+        self._workdir.release()
 
         for k, v in self.services.items():
             v.stop()
@@ -414,6 +423,8 @@ class WorkerBase(ServerNode):
         self._closed.set()
         self._remove_from_global_workers()
         yield super(WorkerBase, self).close()
+
+        setproctitle("dask-worker [closed]")
 
     def __del__(self):
         self._remove_from_global_workers()
@@ -601,43 +612,6 @@ class WorkerBase(ServerNode):
 
         raise gen.Return({'status': 'OK', 'nbytes': len(data)})
 
-    def host_health(self, comm=None):
-        """ Information about worker """
-        d = {'time': time()}
-        try:
-            import psutil
-            mem = psutil.virtual_memory()
-            d.update({'cpu': psutil.cpu_percent(),
-                      'memory': mem.total,
-                      'memory_percent': mem.percent})
-
-            net_io = psutil.net_io_counters()
-            if self._last_net_io:
-                d['network-send'] = net_io.bytes_sent - self._last_net_io.bytes_sent
-                d['network-recv'] = net_io.bytes_recv - self._last_net_io.bytes_recv
-            else:
-                d['network-send'] = 0
-                d['network-recv'] = 0
-            self._last_net_io = net_io
-
-            try:
-                disk_io = psutil.disk_io_counters()
-            except RuntimeError:
-                # This happens when there is no physical disk in worker
-                pass
-            else:
-                if self._last_disk_io:
-                    d['disk-read'] = disk_io.read_bytes - self._last_disk_io.read_bytes
-                    d['disk-write'] = disk_io.write_bytes - self._last_disk_io.write_bytes
-                else:
-                    d['disk-read'] = 0
-                    d['disk-write'] = 0
-                self._last_disk_io = disk_io
-
-        except ImportError:
-            pass
-        return d
-
     def keys(self, comm=None):
         return list(self.data)
 
@@ -701,13 +675,15 @@ cache = dict()
 
 def dumps_function(func):
     """ Dump a function to bytes, cache functions """
-    if func not in cache:
-        b = pickle.dumps(func)
-        if len(b) < 100000:
-            cache[func] = b
-        else:
-            return b
-    return cache[func]
+    try:
+        result = cache[func]
+    except KeyError:
+        result = pickle.dumps(func)
+        if len(result) < 100000:
+            cache[func] = result
+    except TypeError:
+        result = pickle.dumps(func)
+    return result
 
 
 def dumps_task(task):
@@ -733,14 +709,37 @@ def dumps_task(task):
     if istask(task):
         if task[0] is apply and not any(map(_maybe_complex, task[2:])):
             d = {'function': dumps_function(task[1]),
-                 'args': pickle.dumps(task[2])}
+                 'args': warn_dumps(task[2])}
             if len(task) == 4:
-                d['kwargs'] = pickle.dumps(task[3])
+                d['kwargs'] = warn_dumps(task[3])
             return d
         elif not any(map(_maybe_complex, task[1:])):
             return {'function': dumps_function(task[0]),
-                    'args': pickle.dumps(task[1:])}
+                    'args': warn_dumps(task[1:])}
     return to_serialize(task)
+
+
+_warn_dumps_warned = [False]
+
+
+def warn_dumps(obj, dumps=pickle.dumps, limit=1e6):
+    """ Dump an object to bytes, warn if those bytes are large """
+    b = dumps(obj)
+    if not _warn_dumps_warned[0] and len(b) > limit:
+        _warn_dumps_warned[0] = True
+        s = str(obj)
+        if len(s) > 70:
+            s = s[:50] + ' ... ' + s[-15:]
+        warnings.warn("Large object of size %s detected in task graph: \n"
+                      "  %s\n"
+                      "Consider scattering large objects ahead of time\n"
+                      "with client.scatter to reduce scheduler burden and \n"
+                      "keep data on workers\n\n"
+                      "    future = client.submit(func, big_data)    # bad\n\n"
+                      "    big_future = client.scatter(big_data)     # good\n"
+                      "    future = client.submit(func, big_future)  # good"
+                      % (format_bytes(len(b)), s))
+    return b
 
 
 def apply_function(function, args, kwargs, execution_state, key,
@@ -1018,8 +1017,10 @@ class Worker(WorkerBase):
     name: str, optional
     heartbeat_interval: int
         Milliseconds between heartbeats to scheduler
-    memory_limit: int
-        Number of bytes of memory that this worker should use
+    memory_limit: int, float, string
+        Number of bytes of memory that this worker should use.
+        Set to zero for no limit.  Set to 'auto' for 60% of memory use.
+        Use strings or numbers like 5GB or 5e9
     memory_target_fraction: float
         Fraction of memory to try to stay beneath
     memory_spill_fraction: float
@@ -1085,7 +1086,6 @@ class Worker(WorkerBase):
         self.profile_history = deque(maxlen=3600)
 
         self.priorities = dict()
-        self.priority_counter = 0
         self.durations = dict()
         self.startstops = defaultdict(list)
         self.resource_restrictions = dict()
@@ -1097,7 +1097,7 @@ class Worker(WorkerBase):
         self.long_running = set()
 
         self.batched_stream = None
-        self.recent_messages_log = deque(maxlen=10000)
+        self.recent_messages_log = deque(maxlen=config.get('recent-messages-log-length', 0))
         self.target_message_size = 50e6  # 50 MB
 
         self.log = deque(maxlen=100000)
@@ -1138,12 +1138,13 @@ class Worker(WorkerBase):
         WorkerBase.__init__(self, *args, **kwargs)
 
         pc = PeriodicCallback(self.trigger_profile,
-                              config.get('profile-interval', 10))
+                              config.get('profile-interval', 10),
+                              io_loop=self.io_loop)
         self.periodic_callbacks['profile'] = pc
 
         pc = PeriodicCallback(self.cycle_profile,
-                              profile_cycle_interval)
-        pc.start()
+                              profile_cycle_interval,
+                              io_loop=self.io_loop)
         self.periodic_callbacks['profile-cycle'] = pc
 
         _global_workers.append(weakref.ref(self))
@@ -1165,20 +1166,19 @@ class Worker(WorkerBase):
             self.batched_stream = BatchedSend(interval=2, loop=self.loop)
             self.batched_stream.start(comm)
 
-            def on_closed():
-                if self.reconnect and self.status not in ('closed', 'closing'):
-                    logger.info("Connection to scheduler broken. Reregistering")
-                    self._register_with_scheduler()
-                else:
-                    self._close(report=False)
-
             closed = False
 
             while not closed:
                 try:
                     msgs = yield comm.read()
-                except CommClosedError:
-                    on_closed()
+                except CommClosedError as e:
+                    if self.reconnect and self.status not in ('closed', 'closing'):
+                        logger.info("Connection to scheduler broken. Reregistering")
+                        yield self._register_with_scheduler()
+                        return
+                    else:
+                        logger.info("Connection to scheduler broken. Closing")
+                        yield self._close(report=False)
                     break
                 except EnvironmentError as e:
                     break
@@ -1211,8 +1211,6 @@ class Worker(WorkerBase):
                     else:
                         logger.warning("Unknown operation %s, %s", op, msg)
 
-                self.priority_counter -= 1
-
                 self.ensure_communicating()
                 self.ensure_computing()
 
@@ -1220,17 +1218,17 @@ class Worker(WorkerBase):
                 if self.digests is not None:
                     self.digests['handle-messages-duration'].add(end - start)
 
-            yield self.batched_stream.close()
             logger.info('Close compute stream')
         except Exception as e:
             logger.exception(e)
+            yield self._close()
             raise
+        finally:
+            yield self.batched_stream.close()
 
     def add_task(self, key, function=None, args=None, kwargs=None, task=None,
                  who_has=None, nbytes=None, priority=None, duration=None,
                  resource_restrictions=None, **kwargs2):
-        if isinstance(priority, list):
-            priority.insert(1, self.priority_counter)
         try:
             if key in self.tasks:
                 state = self.task_state[key]
@@ -1417,15 +1415,10 @@ class Worker(WorkerBase):
     def transition_dep_waiting_memory(self, dep, value=None):
         try:
             if self.validate:
-                try:
-                    assert dep in self.data
-                    assert dep in self.nbytes
-                    assert dep in self.types
-                    assert self.task_state[dep] == 'memory'
-                except Exception as e:
-                    logger.exception(e)
-                    import pdb
-                    pdb.set_trace()
+                assert dep in self.data
+                assert dep in self.nbytes
+                assert dep in self.types
+                assert self.task_state[dep] == 'memory'
         except Exception as e:
             logger.exception(e)
             if LOG_PDB:
@@ -2202,18 +2195,18 @@ class Worker(WorkerBase):
             # Try to free some memory while in paused state
             self._throttled_gc.collect()
             if not self.paused:
-                logger.warn("Worker is at %d%% memory usage. Pausing worker.  "
-                            "Process memory: %s -- Worker memory limit: %s",
-                            int(frac * 100),
-                            format_bytes(proc.memory_info().rss),
-                            format_bytes(self.memory_limit))
+                logger.warning("Worker is at %d%% memory usage. Pausing worker.  "
+                               "Process memory: %s -- Worker memory limit: %s",
+                               int(frac * 100),
+                               format_bytes(proc.memory_info().rss),
+                               format_bytes(self.memory_limit))
                 self.paused = True
         elif self.paused:
-            logger.warn("Worker is at %d%% memory usage. Resuming worker. "
-                        "Process memory: %s -- Worker memory limit: %s",
-                        int(frac * 100),
-                        format_bytes(proc.memory_info().rss),
-                        format_bytes(self.memory_limit))
+            logger.warning("Worker is at %d%% memory usage. Resuming worker. "
+                           "Process memory: %s -- Worker memory limit: %s",
+                           int(frac * 100),
+                           format_bytes(proc.memory_info().rss),
+                           format_bytes(self.memory_limit))
             self.paused = False
             self.ensure_computing()
 
@@ -2224,12 +2217,12 @@ class Worker(WorkerBase):
             need = memory - target
             while memory > target:
                 if not self.data.fast:
-                    logger.warn("Memory use is high but worker has no data "
-                                "to store to disk.  Perhaps some other process "
-                                "is leaking memory?  Process memory: %s -- "
-                                "Worker memory limit: %s",
-                                format_bytes(proc.memory_info().rss),
-                                format_bytes(self.memory_limit))
+                    logger.warning("Memory use is high but worker has no data "
+                                   "to store to disk.  Perhaps some other process "
+                                   "is leaking memory?  Process memory: %s -- "
+                                   "Worker memory limit: %s",
+                                   format_bytes(proc.memory_info().rss),
+                                   format_bytes(self.memory_limit))
                     break
                 k, v, weight = self.data.fast.evict()
                 del k, v
@@ -2351,6 +2344,7 @@ class Worker(WorkerBase):
         return result
 
     def get_logs(self, comm=None, n=None):
+        deque_handler = self._deque_handler
         if n is None:
             L = list(deque_handler.deque)
         else:
@@ -2397,8 +2391,9 @@ class Worker(WorkerBase):
                 self.validate_key_executing(key)
         except Exception as e:
             logger.exception(e)
-            import pdb
-            pdb.set_trace()
+            if LOG_PDB:
+                import pdb
+                pdb.set_trace()
             raise
 
     def validate_dep_waiting(self, dep):
@@ -2434,8 +2429,9 @@ class Worker(WorkerBase):
                 raise ValueError("Unknown dependent state", state)
         except Exception as e:
             logger.exception(e)
-            import pdb
-            pdb.set_trace()
+            if LOG_PDB:
+                import pdb
+                pdb.set_trace()
             raise
 
     def validate_state(self):
@@ -2520,10 +2516,11 @@ class Worker(WorkerBase):
         if not self._client:
             from .client import Client
             asynchronous = self.loop is IOLoop.current()
-            self._client = Client(self.scheduler.address, loop=self.loop,
+            self._client = Client(self.scheduler, loop=self.loop,
                                   security=self.security,
                                   set_as_default=True,
                                   asynchronous=asynchronous,
+                                  name='worker',
                                   timeout=timeout)
             if not asynchronous:
                 assert self._client.status == 'running'
@@ -2612,7 +2609,7 @@ def get_client(address=None, timeout=3):
 
     from .client import _get_global_client
     client = _get_global_client()  # TODO: assumes the same scheduler
-    if client and not address or client.scheduler.address == address:
+    if client and (not address or client.scheduler.address == address):
         return client
     elif address:
         from .client import Client
@@ -2625,7 +2622,10 @@ def secede():
     """
     Have this task secede from the worker's thread pool
 
-    This opens up a new scheduling slot and a new thread for a new task.
+    This opens up a new scheduling slot and a new thread for a new task. This
+    enables the client to schedule tasks on this node, which is
+    especially useful while waiting for other jobs to finish (e.g., with
+    ``client.gather``).
 
     Examples
     --------
@@ -2661,3 +2661,19 @@ class Reschedule(Exception):
     the task.
     """
     pass
+
+
+def parse_memory_limit(memory_limit, ncores):
+    if memory_limit is None:
+        return None
+    if memory_limit == 'auto':
+        memory_limit = int(TOTAL_MEMORY * min(1, ncores / _ncores))
+    with ignoring(ValueError, TypeError):
+        x = float(memory_limit)
+        if isinstance(x, float) and x <= 1:
+            return int(x * TOTAL_MEMORY)
+
+    if isinstance(memory_limit, (unicode, str)):
+        return parse_bytes(memory_limit)
+    else:
+        return int(memory_limit)

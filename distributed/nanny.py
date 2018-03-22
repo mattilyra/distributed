@@ -18,10 +18,11 @@ from .core import rpc, RPCClosed, CommClosedError, coerce_to_address
 from .metrics import time
 from .node import ServerNode
 from .process import AsyncProcess
+from .proctitle import enable_proctitle_on_children
 from .security import Security
 from .utils import (get_ip, mp_context, silence_logging, json_load_robust,
-        ignoring, PeriodicCallback)
-from .worker import _ncores, run, TOTAL_MEMORY
+        PeriodicCallback)
+from .worker import _ncores, run, parse_memory_limit
 
 
 logger = logging.getLogger(__name__)
@@ -41,11 +42,13 @@ class Nanny(ServerNode):
                  ncores=None, loop=None, local_dir=None, services=None,
                  name=None, memory_limit='auto', reconnect=True,
                  validate=False, quiet=False, resources=None, silence_logs=None,
-                 death_timeout=None, preload=(), security=None,
+                 death_timeout=None, preload=(), preload_argv=[], security=None,
                  contact_address=None, listen_address=None, **kwargs):
         if scheduler_file:
             cfg = json_load_robust(scheduler_file)
             self.scheduler_addr = cfg['address']
+        elif scheduler_ip is None and config.get('scheduler-address'):
+            self.scheduler_addr = config['scheduler-address']
         elif scheduler_port is None:
             self.scheduler_addr = coerce_to_address(scheduler_ip)
         else:
@@ -57,6 +60,8 @@ class Nanny(ServerNode):
         self.resources = resources
         self.death_timeout = death_timeout
         self.preload = preload
+        self.preload_argv = preload_argv
+
         self.contact_address = contact_address
         self.memory_terminate_fraction = config.get('worker-memory-terminate', 0.95)
 
@@ -74,13 +79,7 @@ class Nanny(ServerNode):
         self.quiet = quiet
         self.auto_restart = True
 
-        if memory_limit == 'auto':
-            memory_limit = int(TOTAL_MEMORY * min(1, self.ncores / _ncores))
-        with ignoring(TypeError):
-            memory_limit = float(memory_limit)
-        if isinstance(memory_limit, float) and memory_limit <= 1:
-            memory_limit = memory_limit * TOTAL_MEMORY
-        self.memory_limit = memory_limit
+        self.memory_limit = parse_memory_limit(memory_limit, self.ncores)
 
         if silence_logs:
             silence_logging(level=silence_logs)
@@ -97,8 +96,9 @@ class Nanny(ServerNode):
                                     connection_args=self.connection_args,
                                     **kwargs)
 
-        pc = PeriodicCallback(self.memory_monitor, 100)
-        self.periodic_callbacks['memory'] = pc
+        if self.memory_limit:
+            pc = PeriodicCallback(self.memory_monitor, 100, io_loop=self.loop)
+            self.periodic_callbacks['memory'] = pc
 
         self._listen_address = listen_address
         self.status = 'init'
@@ -157,8 +157,7 @@ class Nanny(ServerNode):
             assert self.worker_address
             self.status = 'running'
 
-        for pc in self.periodic_callbacks.values():
-            pc.start()
+        self.start_periodic_callbacks()
 
     def start(self, addr_or_port=0):
         self.loop.add_callback(self._start, addr_or_port)
@@ -206,6 +205,7 @@ class Nanny(ServerNode):
                                    silence_logs=self.silence_logs,
                                    death_timeout=self.death_timeout,
                                    preload=self.preload,
+                                   preload_argv=self.preload_argv,
                                    security=self.security,
                                    contact_address=self.contact_address),
                 worker_start_args=(start_arg,),
@@ -226,7 +226,7 @@ class Nanny(ServerNode):
         raise gen.Return('OK')
 
     @gen.coroutine
-    def restart(self, comm=None, timeout=2):
+    def restart(self, comm=None, timeout=2, executor_wait=True):
         start = time()
 
         @gen.coroutine
@@ -250,7 +250,7 @@ class Nanny(ServerNode):
         memory = psutil.Process(self.process.pid).memory_info().rss
         frac = memory / self.memory_limit
         if self.memory_terminate_fraction and frac > self.memory_terminate_fraction:
-            logger.warn("Worker exceeded 95% memory budget.  Restarting")
+            logger.warning("Worker exceeded 95% memory budget.  Restarting")
             self.process.process.terminate()
 
     def is_alive(self):
@@ -325,31 +325,44 @@ class WorkerProcess(object):
         """
         Ensure the worker process is started.
         """
+        enable_proctitle_on_children()
         if self.status == 'running':
             return
         if self.status == 'starting':
             yield self.running.wait()
             return
 
-        self.init_result_q = mp_context.Queue()
-        self.child_stop_q = mp_context.Queue()
-        self.process = AsyncProcess(
-            target=self._run,
-            kwargs=dict(worker_args=self.worker_args,
-                        worker_kwargs=self.worker_kwargs,
-                        worker_start_args=self.worker_start_args,
-                        silence_logs=self.silence_logs,
-                        init_result_q=self.init_result_q,
-                        child_stop_q=self.child_stop_q),
-        )
-        self.process.daemon = True
-        self.process.set_exit_callback(self._on_exit)
-        self.running = Event()
-        self.stopped = Event()
-        self.status = 'starting'
-        yield self.process.start()
-        if self.status == 'starting':
-            yield self._wait_until_running()
+        while True:
+            # FIXME: this sometimes stalls in _wait_until_running
+            # our temporary solution is to retry a few times if the process
+            # doesn't start up in five seconds
+            self.init_result_q = mp_context.Queue()
+            self.child_stop_q = mp_context.Queue()
+            try:
+                self.process = AsyncProcess(
+                    target=self._run,
+                    kwargs=dict(worker_args=self.worker_args,
+                                worker_kwargs=self.worker_kwargs,
+                                worker_start_args=self.worker_start_args,
+                                silence_logs=self.silence_logs,
+                                init_result_q=self.init_result_q,
+                                child_stop_q=self.child_stop_q),
+                )
+                self.process.daemon = True
+                self.process.set_exit_callback(self._on_exit)
+                self.running = Event()
+                self.stopped = Event()
+                self.status = 'starting'
+                yield self.process.start()
+                if self.status == 'starting':
+                    yield gen.with_timeout(timedelta(seconds=5),
+                                           self._wait_until_running())
+            except gen.TimeoutError:
+                logger.info("Failed to start worker process.  Restarting")
+                yield gen.with_timeout(timedelta(seconds=1),
+                                       self.process.terminate())
+            else:
+                break
 
     def _on_exit(self, proc):
         if proc is not self.process:
@@ -398,7 +411,7 @@ class WorkerProcess(object):
                 self.on_exit(r)
 
     @gen.coroutine
-    def kill(self, timeout=2):
+    def kill(self, timeout=2, executor_wait=True):
         """
         Ensure the worker process is stopped, waiting at most
         *timeout* seconds before terminating it abruptly.
@@ -417,6 +430,7 @@ class WorkerProcess(object):
         process = self.process
         self.child_stop_q.put({'op': 'stop',
                                'timeout': max(0, deadline - loop.time()) * 0.8,
+                               'executor_wait': executor_wait,
                                })
 
         while process.is_alive() and loop.time() < deadline:
@@ -474,9 +488,12 @@ class WorkerProcess(object):
         worker = Worker(*worker_args, **worker_kwargs)
 
         @gen.coroutine
-        def do_stop(timeout):
+        def do_stop(timeout=5, executor_wait=True):
             try:
-                yield worker._close(report=False, nanny=False)
+                yield worker._close(report=False,
+                                    nanny=False,
+                                    executor_wait=executor_wait,
+                                    timeout=timeout)
             finally:
                 loop.stop()
 
@@ -491,8 +508,8 @@ class WorkerProcess(object):
                 except Empty:
                     pass
                 else:
-                    assert msg['op'] == 'stop'
-                    loop.add_callback(do_stop, msg['timeout'])
+                    assert msg.pop('op') == 'stop'
+                    loop.add_callback(do_stop, **msg)
                     break
 
         t = threading.Thread(target=watch_stop_q, name="Nanny stop queue watch")

@@ -5,16 +5,12 @@ from functools import partial
 import io
 import socket
 import sys
-from time import sleep
-from threading import Thread
-import threading
 import traceback
 
 import numpy as np
 import pytest
 from tornado import gen
 from tornado.ioloop import IOLoop
-from tornado.locks import Event
 
 import dask
 from distributed.compatibility import Queue, Empty, isqueue, PY2
@@ -23,8 +19,9 @@ from distributed.utils import (All, sync, is_kernel, ensure_ip, str_graph,
                                truncate_exception, get_traceback, queue_to_iterator,
                                iterator_to_queue, _maybe_complex, read_block, seek_delimiter,
                                funcname, ensure_bytes, open_port, get_ip_interface, nbytes,
-                               set_thread_state, thread_state, LoopRunner)
-from distributed.utils_test import loop, loop_in_thread  # flake8: noqa
+                               set_thread_state, thread_state, LoopRunner,
+                               parse_bytes)
+from distributed.utils_test import loop, loop_in_thread  # noqa: F401
 from distributed.utils_test import div, has_ipv6, inc, throws, gen_test
 
 
@@ -93,15 +90,6 @@ def test_sync_error(loop_in_thread):
         assert any('function2' in line for line in L)
 
 
-def test_sync_inactive_loop(loop):
-    @gen.coroutine
-    def f(x):
-        raise gen.Return(x + 1)
-
-    y = sync(loop, f, 1)
-    assert y == 2
-
-
 def test_sync_timeout(loop_in_thread):
     loop = loop_in_thread
     with pytest.raises(gen.TimeoutError):
@@ -126,9 +114,10 @@ def test_is_kernel():
 
 #@pytest.mark.leaking('fds')
 #def test_zzz_leaks(l=[]):
-    #import os
+    #import os, subprocess
     #l.append(b"x" * (17 * 1024**2))
     #os.open(__file__, os.O_RDONLY)
+    #subprocess.Popen('sleep 100', shell=True, stdin=subprocess.DEVNULL)
 
 
 def test_ensure_ip():
@@ -292,7 +281,7 @@ def test_funcname():
 def test_ensure_bytes():
     data = [b'1', '1', memoryview(b'1'), bytearray(b'1')]
     if PY2:
-        data.append(buffer(b'1'))  # flake8: noqa
+        data.append(buffer(b'1'))  # noqa: F821
     for d in data:
         result = ensure_bytes(d)
         assert isinstance(result, bytes)
@@ -335,6 +324,7 @@ def assert_running(loop):
     q = Queue()
     loop.add_callback(q.put, 42)
     assert q.get(timeout=1) == 42
+
 
 def assert_not_running(loop):
     """
@@ -418,6 +408,61 @@ def test_loop_runner(loop_in_thread):
     assert_not_running(runner.loop)
 
 
+def test_two_loop_runners(loop_in_thread):
+    # Loop runners tied to the same loop should cooperate
+
+    # ABCCBA
+    loop = IOLoop()
+    a = LoopRunner(loop=loop)
+    b = LoopRunner(loop=loop)
+    assert_not_running(loop)
+    a.start()
+    assert_running(loop)
+    c = LoopRunner(loop=loop)
+    b.start()
+    assert_running(loop)
+    c.start()
+    assert_running(loop)
+    c.stop()
+    assert_running(loop)
+    b.stop()
+    assert_running(loop)
+    a.stop()
+    assert_not_running(loop)
+
+    # ABCABC
+    loop = IOLoop()
+    a = LoopRunner(loop=loop)
+    b = LoopRunner(loop=loop)
+    assert_not_running(loop)
+    a.start()
+    assert_running(loop)
+    b.start()
+    assert_running(loop)
+    c = LoopRunner(loop=loop)
+    c.start()
+    assert_running(loop)
+    a.stop()
+    assert_running(loop)
+    b.stop()
+    assert_running(loop)
+    c.stop()
+    assert_not_running(loop)
+
+    # Explicit loop, already started
+    a = LoopRunner(loop=loop_in_thread)
+    b = LoopRunner(loop=loop_in_thread)
+    assert_running(loop_in_thread)
+    a.start()
+    assert_running(loop_in_thread)
+    b.start()
+    assert_running(loop_in_thread)
+    a.stop()
+    assert_running(loop_in_thread)
+    b.stop()
+    assert_running(loop_in_thread)
+
+
 @gen_test()
 def test_loop_runner_gen():
     runner = LoopRunner(asynchronous=True)
@@ -430,3 +475,16 @@ def test_loop_runner_gen():
     runner.stop()
     assert not runner.is_started()
     yield gen.sleep(0.01)
+
+
+def test_parse_bytes():
+    assert parse_bytes('100') == 100
+    assert parse_bytes('100 MB') == 100000000
+    assert parse_bytes('100M') == 100000000
+    assert parse_bytes('5kB') == 5000
+    assert parse_bytes('5.4 kB') == 5400
+    assert parse_bytes('1kiB') == 1024
+    assert parse_bytes('1Mi') == 2**20
+    assert parse_bytes('1e6') == 1000000
+    assert parse_bytes('1e6 kB') == 1000000000
+    assert parse_bytes('MB') == 1000000

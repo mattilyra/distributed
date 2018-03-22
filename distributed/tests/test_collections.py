@@ -11,7 +11,7 @@ import dask.bag as db
 from distributed import Client
 from distributed.client import wait
 from distributed.utils_test import cluster, gen_cluster
-from distributed.utils_test import loop # flake8: noqa
+from distributed.utils_test import loop # noqa F401
 import numpy as np
 import pandas as pd
 import pandas.util.testing as tm
@@ -136,7 +136,7 @@ def test_rolling_sync(loop):
         with Client(s['address'], loop=loop) as c:
             df = pd.util.testing.makeTimeDataFrame()
             ddf = dd.from_pandas(df, npartitions=10)
-            dd.rolling_mean(ddf.A, 2).compute(get=c.get)
+            ddf.A.rolling(2).mean().compute(get=c.get)
 
 
 @gen_cluster(client=True)

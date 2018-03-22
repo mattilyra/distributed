@@ -1,5 +1,6 @@
 from __future__ import print_function, division, absolute_import
 
+import random
 from time import sleep
 import sys
 
@@ -9,7 +10,7 @@ from tornado import gen
 from distributed import Client, Variable, worker_client, Nanny, wait
 from distributed.metrics import time
 from distributed.utils_test import (gen_cluster, inc, cluster, slow, div)
-from distributed.utils_test import loop # flake8: noqa
+from distributed.utils_test import loop # noqa: F401
 
 
 @gen_cluster(client=True)
@@ -27,12 +28,12 @@ def test_variable(c, s, a, b):
     del future, future2
 
     yield gen.sleep(0.1)
-    assert s.task_state  # future still present
+    assert s.tasks  # future still present
 
     x.delete()
 
     start = time()
-    while s.task_state:
+    while s.tasks:
         yield gen.sleep(0.01)
         assert time() < start + 5
 
@@ -88,7 +89,7 @@ def test_timeout(c, s, a, b):
     start = time()
     with pytest.raises(gen.TimeoutError):
         yield v.get(timeout=0.1)
-    assert time() - start < 0.5
+    assert 0.05 < time() - start < 2.0
 
 
 @gen_cluster(client=True)
@@ -144,15 +145,17 @@ def test_timeout_get(c, s, a, b):
 @gen_cluster(client=True, ncores=[('127.0.0.1', 2)] * 5, Worker=Nanny,
              timeout=None)
 def test_race(c, s, *workers):
+    NITERS = 50
+
     def f(i):
         with worker_client() as c:
             v = Variable('x', client=c)
-            for _ in range(100):
+            for _ in range(NITERS):
                 future = v.get()
                 x = future.result()
                 y = c.submit(inc, x)
                 v.set(y)
-                sleep(0.01)
+                sleep(0.01 * random.random())
             result = v.get().result()
             sleep(0.1)  # allow fire-and-forget messages to clear
             return result
@@ -161,16 +164,14 @@ def test_race(c, s, *workers):
     x = yield c.scatter(1)
     yield v.set(x)
 
-    futures = c.map(f, range(10))
+    futures = c.map(f, range(15))
     results = yield c.gather(futures)
-    assert all(r > 80 for r in results)
+    assert all(r > NITERS * 0.8 for r in results)
 
     start = time()
     while len(s.wants_what['variable-x']) != 1:
         yield gen.sleep(0.01)
-        if not time() - start < 2:
-            import pdb
-            pdb.set_trace()
+        assert time() - start < 2
 
 
 @gen_cluster(client=True)
@@ -204,3 +205,32 @@ def test_Future_knows_status_immediately(c, s, a, b):
             yield gen.sleep(0.05)
 
     yield c2.close()
+
+
+@gen_cluster(client=True)
+def test_erred_future(c, s, a, b):
+    future = c.submit(div, 1, 0)
+    var = Variable()
+    yield var.set(future)
+    yield gen.sleep(0.1)
+    future2 = yield var.get()
+    with pytest.raises(ZeroDivisionError):
+        yield future2.result()
+
+    exc = yield future2.exception()
+    assert isinstance(exc, ZeroDivisionError)
+
+
+def test_future_erred_sync(loop):
+    with cluster() as (s, [a, b]):
+        with Client(s['address']) as c:
+            future = c.submit(div, 1, 0)
+            var = Variable()
+            var.set(future)
+
+            sleep(0.1)
+
+            future2 = var.get()
+
+            with pytest.raises(ZeroDivisionError):
+                future2.result()

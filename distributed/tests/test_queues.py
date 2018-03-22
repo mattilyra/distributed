@@ -10,7 +10,7 @@ from tornado import gen
 from distributed import Client, Queue, Nanny, worker_client, wait
 from distributed.metrics import time
 from distributed.utils_test import (gen_cluster, inc, cluster, slow, div)
-from distributed.utils_test import loop # flake8: noqa
+from distributed.utils_test import loop # noqa: F401
 
 
 @gen_cluster(client=True)
@@ -33,11 +33,11 @@ def test_queue(c, s, a, b):
     del future, future2
 
     yield gen.sleep(0.1)
-    assert s.task_state  # future still present in y's queue
+    assert s.tasks  # future still present in y's queue
     yield y.get()  # burn future
 
     start = time()
-    while s.task_state:
+    while s.tasks:
         yield gen.sleep(0.01)
         assert time() < start + 5
 
@@ -225,3 +225,17 @@ def test_Future_knows_status_immediately(c, s, a, b):
             yield gen.sleep(0.05)
 
     yield c2.close()
+
+
+@gen_cluster(client=True)
+def test_erred_future(c, s, a, b):
+    future = c.submit(div, 1, 0)
+    q = Queue()
+    yield q.put(future)
+    yield gen.sleep(0.1)
+    future2 = yield q.get()
+    with pytest.raises(ZeroDivisionError):
+        yield future2.result()
+
+    exc = yield future2.exception()
+    assert isinstance(exc, ZeroDivisionError)

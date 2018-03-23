@@ -2932,7 +2932,7 @@ class Scheduler(ServerNode):
 
         prefix = ts.prefix
         unknowns = self.unknown_durations[prefix]
-        print(prefix, unknowns)
+        logging.getLogger(__name__).info(prefix, unknowns)
         if unknowns:
             unknowns.remove(ts)
             self.task_duration[prefix] = default

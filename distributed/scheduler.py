@@ -2916,7 +2916,7 @@ class Scheduler(ServerNode):
         try:
             return self.task_duration[prefix]
         except KeyError:
-            add_callback = ts not in self.unknown_durations[prefix]
+            add_callback = ts not in self.unknown_durations[prefix] and ts.processing_on
             self.unknown_durations[prefix].add(ts)
             if add_callback:
                 # add callback to check back in 5 seconds if the job is still in unknown durations

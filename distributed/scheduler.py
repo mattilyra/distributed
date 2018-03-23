@@ -2920,7 +2920,7 @@ class Scheduler(ServerNode):
             self.unknown_durations[prefix].add(ts)
             if add_callback:
                 # add callback to check back in 5 seconds if the job is still in unknown durations
-                self.io_loop.call_later(15, self.check_task_duration, ts=ts)
+                self.io_loop.call_later(5, self.check_task_duration, ts=ts)
 
             return default
 

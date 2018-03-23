@@ -3858,6 +3858,7 @@ class Scheduler(ServerNode):
                 for ws, supplied in resources[resource].items():
                     if supplied >= required:
                         w[resource].add(ws)
+                        resources[resource][ws] -= required
 
             ww = set.intersection(*w.values())
 

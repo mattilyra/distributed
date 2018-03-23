@@ -2917,7 +2917,26 @@ class Scheduler(ServerNode):
             return self.task_duration[prefix]
         except KeyError:
             self.unknown_durations[prefix].add(ts)
+            # add callback to check back in 5 seconds if the job is still in unknown durations
+            self.io_loop.call_later(5, self.check_task_duration, ts)
             return default
+
+    @gen.coroutine
+    def check_task_duration(self, ts, default=5):
+        ws = ts.processing_on
+        if not ws:
+            return
+
+        prefix = ts.prefix
+        if prefix in self.unknown_durations:
+            self.unknown_durations[prefix].remove(ts)
+            self.task_duration[prefix] = default
+            ws.processing[ts] = default
+            if 'stealing' in self.extensions:
+                steal = self.extensions['stealing']
+                steal.remove_key_from_stealable(ts)
+                steal.put_key_in_stealable(ts)
+                steal.balance()
 
     def run_function(self, stream, function, args=(), kwargs={}):
         """ Run a function within this process

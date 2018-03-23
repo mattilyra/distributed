@@ -2916,9 +2916,10 @@ class Scheduler(ServerNode):
         try:
             return self.task_duration[prefix]
         except KeyError:
+            if ts not in self.unknown_durations[prefix]:
+                # add callback to check back in 5 seconds if the job is still in unknown durations
+                self.io_loop.call_later(5, self.check_task_duration, ts)
             self.unknown_durations[prefix].add(ts)
-            # add callback to check back in 5 seconds if the job is still in unknown durations
-            self.io_loop.call_later(5, self.check_task_duration, ts)
             return default
 
     @gen.coroutine

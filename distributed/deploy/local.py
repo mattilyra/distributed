@@ -264,7 +264,7 @@ class LocalCluster(object):
 
         This can be implemented either as a function or as a Tornado coroutine.
         """
-        logging.getLogger(__name__).info('Adding %s workers. %s desired, %s currently', n - len(self.workers), n, len(self.workers))
+        logging.getLogger(__name__).info('Adding %s workers. %s desired, %s/%s currently', n - len(self.workers), n, len(self.scheduler.workers), len(self.workers))
         yield [self._start_worker(**kwargs)
                for i in range(n - len(self.workers))]
 

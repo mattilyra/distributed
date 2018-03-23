@@ -113,6 +113,11 @@ class WorkStealing(SchedulerPlugin):
             self.stealable_all[level].remove(ts)
         except KeyError:
             pass
+        try:
+            prefix = ts.prefix
+            self.stealable_unknown_durations[prefix].remove(ts)
+        except KeyError:
+            pass
 
     def steal_time_ratio(self, ts):
         """ The compute to communication time ratio of a key

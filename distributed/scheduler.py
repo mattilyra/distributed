@@ -3853,8 +3853,10 @@ class Scheduler(ServerNode):
             # virtual accounting of resources, actual accounting will be done
             # if and when the tasks are given to workers
             resources = self.resources.copy()
-            w = defaultdict(set)
+            w = dict()
             for resource, required in ts.resource_restrictions.items():
+                if resource not in w:
+                    w[resource] = set()
                 for ws, supplied in resources[resource].items():
                     if supplied >= required:
                         w[resource].add(ws)

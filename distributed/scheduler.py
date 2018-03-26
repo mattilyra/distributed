@@ -2995,7 +2995,6 @@ class Scheduler(ServerNode):
 
             return default
 
-    @gen.coroutine
     def check_task_duration(self, ts, default=5):
         ws = ts.processing_on
         if not ws:
@@ -3006,6 +3005,8 @@ class Scheduler(ServerNode):
         logging.getLogger(__name__).info('%s -- %s', prefix, unknowns)
         if unknowns:
             unknowns.remove(ts)
+            if not unknowns:
+                del self.unknown_durations[prefix]
             self.task_duration[prefix] = default
             ws.processing[ts] = default
             if 'stealing' in self.extensions:

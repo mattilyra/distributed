@@ -153,9 +153,11 @@ class Nanny(ServerNode):
 
         logger.info('        Start Nanny at: %r', self.address)
         response = yield self.instantiate()
-        if response == 'OK':
+        if response == 'running':
             assert self.worker_address
             self.status = 'running'
+        else:
+            yield self._close()
 
         self.start_periodic_callbacks()
 
@@ -216,14 +218,16 @@ class Nanny(ServerNode):
         self.auto_restart = True
         if self.death_timeout:
             try:
-                yield gen.with_timeout(timedelta(seconds=self.death_timeout),
-                                       self.process.start())
+                result = yield gen.with_timeout(
+                        timedelta(seconds=self.death_timeout),
+                        self.process.start()
+                )
             except gen.TimeoutError:
                 yield self._close(timeout=self.death_timeout)
                 raise gen.Return('timed out')
         else:
-            yield self.process.start()
-        raise gen.Return('OK')
+            result = yield self.process.start()
+        raise gen.Return(result)
 
     @gen.coroutine
     def restart(self, comm=None, timeout=2, executor_wait=True):
@@ -327,13 +331,13 @@ class WorkerProcess(object):
         """
         enable_proctitle_on_children()
         if self.status == 'running':
-            return
+            raise gen.Return(self.status)
         if self.status == 'starting':
             yield self.running.wait()
-            return
+            raise gen.Return(self.status)
 
         while True:
-            # FIXME: this sometimes stalls in _wait_until_running
+            # FIXME: this sometimes stalls in _wait_until_connected
             # our temporary solution is to retry a few times if the process
             # doesn't start up in five seconds
             self.init_result_q = mp_context.Queue()
@@ -356,13 +360,25 @@ class WorkerProcess(object):
                 yield self.process.start()
                 if self.status == 'starting':
                     yield gen.with_timeout(timedelta(seconds=5),
-                                           self._wait_until_running())
+                                           self._wait_until_started())
             except gen.TimeoutError:
                 logger.info("Failed to start worker process.  Restarting")
                 yield gen.with_timeout(timedelta(seconds=1),
                                        self.process.terminate())
             else:
                 break
+
+        if self.status == 'starting':
+            msg = yield self._wait_until_connected()
+            if not msg:
+                raise gen.Return(self.status)
+            self.worker_address = msg['address']
+            self.worker_dir = msg['dir']
+            assert self.worker_address
+            self.status = 'running'
+            self.running.set()
+
+        raise gen.Return(self.status)
 
     def _on_exit(self, proc):
         if proc is not self.process:
@@ -445,7 +461,21 @@ class WorkerProcess(object):
                 logger.error("Failed to kill worker process: %s", e)
 
     @gen.coroutine
-    def _wait_until_running(self):
+    def _wait_until_started(self):
+        delay = 0.05
+        while True:
+            if self.status != 'starting':
+                return
+            try:
+                msg = self.init_result_q.get_nowait()
+                assert msg == 'started', msg
+                return
+            except Empty:
+                yield gen.sleep(delay)
+                continue
+
+    @gen.coroutine
+    def _wait_until_connected(self):
         delay = 0.05
         while True:
             if self.status != 'starting':
@@ -457,14 +487,11 @@ class WorkerProcess(object):
                 continue
 
             if isinstance(msg, Exception):
+                logger.error("Failed while trying to start worker process",
+                             exc_info=True)
                 yield self.process.join()
                 raise msg
             else:
-                self.worker_address = msg['address']
-                self.worker_dir = msg['dir']
-                assert self.worker_address
-                self.status = 'running'
-                self.running.set()
                 raise gen.Return(msg)
 
     @classmethod
@@ -521,6 +548,7 @@ class WorkerProcess(object):
             """
             Try to start worker and inform parent of outcome.
             """
+            init_result_q.put('started')
             try:
                 yield worker._start(*worker_start_args)
             except Exception as e:

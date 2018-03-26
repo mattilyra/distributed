@@ -38,7 +38,7 @@ from tornado import gen, queues
 from tornado.gen import TimeoutError
 from tornado.ioloop import IOLoop
 
-from .compatibility import PY3
+from .compatibility import PY3, iscoroutinefunction
 from .config import config, initialize_logging
 from .core import connect, rpc, CommClosedError
 from .metrics import time
@@ -621,7 +621,10 @@ def gen_test(timeout=10):
     def _(func):
         def test_func():
             with pristine_loop() as loop:
-                cor = gen.coroutine(func)
+                if iscoroutinefunction(func):
+                    cor = func
+                else:
+                    cor = gen.coroutine(func)
                 try:
                     loop.run_sync(cor, timeout=timeout)
                 finally:
@@ -652,7 +655,8 @@ def start_cluster(ncores, scheduler_addr, loop, security=None,
     yield [w._start(ncore[0]) for ncore, w in zip(ncores, workers)]
 
     start = time()
-    while len(s.workers) < len(ncores):
+    while (len(s.workers) < len(ncores) or
+           any(comm.comm is None for comm in s.worker_comms.values())):
         yield gen.sleep(0.01)
         if time() - start > 5:
             yield [w._close(timeout=1) for w in workers]
@@ -723,8 +727,8 @@ def gen_cluster(ncores=[('127.0.0.1', 1), ('127.0.0.1', 2)],
                                     ncores, scheduler, loop, security=security,
                                     Worker=Worker, scheduler_kwargs=scheduler_kwargs,
                                     worker_kwargs=worker_kwargs)
-                            except Exception:
-                                logger.error("Failed to start gen_cluster, retryng")
+                            except Exception as e:
+                                logger.error("Failed to start gen_cluster, retryng", exc_info=True)
                             else:
                                 break
                         workers[:] = ws
@@ -739,7 +743,7 @@ def gen_cluster(ncores=[('127.0.0.1', 1), ('127.0.0.1', 2)],
                                 s.validate_state()
                         finally:
                             if client:
-                                yield c._close()
+                                yield c._close(fast=s.status == 'closed')
                             yield end_cluster(s, workers)
                             _globals.clear()
                             _globals.update(old_globals)

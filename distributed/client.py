@@ -60,7 +60,8 @@ from .threadpoolexecutor import rejoin
 from .worker import dumps_task, get_client, get_worker, secede
 from .utils import (All, sync, funcname, ignoring, queue_to_iterator,
                     tokey, log_errors, str_graph, key_split, format_bytes, asciitable,
-                    thread_state, no_default, PeriodicCallback, LoopRunner)
+                    thread_state, no_default, PeriodicCallback, LoopRunner,
+                    parse_timedelta)
 from .versions import get_versions
 
 
@@ -450,7 +451,9 @@ class Client(Node):
     security: (optional)
         Optional security information
     asynchronous: bool (False by default)
-        Set to True if this client will be used within a Tornado event loop
+        Set to True if using this client within async/await functions or within
+        Tornado gen.coroutines.  Otherwise this should remain False for normal
+        use.
     name: string (optional)
         Gives the client a name that will be included in logs generated on
         the scheduler for matters relating to this client
@@ -481,10 +484,15 @@ class Client(Node):
     --------
     distributed.scheduler.Scheduler: Internal scheduler
     """
-    def __init__(self, address=None, loop=None, timeout=5,
+    def __init__(self, address=None, loop=None, timeout=no_default,
                  set_as_default=True, scheduler_file=None,
                  security=None, asynchronous=False,
                  name=None, heartbeat_interval=None, **kwargs):
+        if timeout == no_default:
+            timeout = config.get('connect-timeout', '5s')
+        if timeout is not None:
+            timeout = parse_timedelta(timeout, 's')
+        self._timeout = timeout
 
         self.futures = dict()
         self.refcount = defaultdict(lambda: 0)
@@ -516,13 +524,17 @@ class Client(Node):
         self._loop_runner = LoopRunner(loop=loop, asynchronous=asynchronous)
         self.loop = self._loop_runner.loop
 
+        if heartbeat_interval is None:
+            heartbeat_interval = config.get('client-heartbeat-interval', 5000)
+        heartbeat_interval = parse_timedelta(heartbeat_interval, default='ms')
+
         self._periodic_callbacks = dict()
         self._periodic_callbacks['scheduler-info'] = PeriodicCallback(
                 self._update_scheduler_info, 2000, io_loop=self.loop
         )
         self._periodic_callbacks['heartbeat'] = PeriodicCallback(
                 self._heartbeat,
-                heartbeat_interval or config.get('client-heartbeat-interval', 5000),
+                heartbeat_interval * 1000,
                 io_loop=self.loop
         )
 
@@ -636,10 +648,11 @@ class Client(Node):
             protocol, rest = self.scheduler.address.split('://')
             port = info['services']['bokeh']
             if protocol == 'inproc':
-                address = 'http://localhost:%d/status' % port
+                host = 'localhost'
             else:
                 host = rest.split(':')[0]
-                address = 'http://%s:%d/status' % (host, port)
+            template = config.get('diagnostics-link', 'http://{host}:{port}/status')
+            address = template.format(host=host, port=port, **os.environ)
             text += "  <li><b>Dashboard: </b><a href='%(web)s' target='_blank'>%(web)s</a>\n" % {'web': address}
 
         text += "</ul>\n"
@@ -685,7 +698,11 @@ class Client(Node):
 
     def _send_to_scheduler_safe(self, msg):
         if self.status in ('running', 'closing'):
-            self.scheduler_comm.send(msg)
+            try:
+                self.scheduler_comm.send(msg)
+            except CommClosedError:
+                if self.status == 'running':
+                    raise
         elif self.status in ('connecting', 'newly-created'):
             self._pending_msg_buffer.append(msg)
 
@@ -697,7 +714,12 @@ class Client(Node):
                             "Message: %s" % (self.status, msg))
 
     @gen.coroutine
-    def _start(self, timeout=5, **kwargs):
+    def _start(self, timeout=no_default, **kwargs):
+        if timeout == no_default:
+            timeout = config.get('connect-timeout', '5s')
+        if timeout is not None:
+            timeout = parse_timedelta(timeout, 's')
+
         address = self._start_arg
         if self.cluster is not None:
             # Ensure the cluster is started (no-op if already running)
@@ -724,16 +746,17 @@ class Client(Node):
             from .deploy import LocalCluster
 
             try:
-                self.cluster = LocalCluster(loop=self.loop, start=False,
+                self.cluster = LocalCluster(loop=self.loop, asynchronous=True,
                                             **self._startup_kwargs)
-                yield self.cluster._start()
+                yield self.cluster
             except (OSError, socket.error) as e:
                 if e.errno != errno.EADDRINUSE:
                     raise
                 # The default port was taken, use a random one
                 self.cluster = LocalCluster(scheduler_port=0, loop=self.loop,
-                                            start=False, **self._startup_kwargs)
-                yield self.cluster._start()
+                                            asynchronous=True,
+                                            **self._startup_kwargs)
+                yield self.cluster
 
             # Wait for all workers to be ready
             # XXX should be a LocalCluster method instead
@@ -796,7 +819,7 @@ class Client(Node):
         assert len(msg) == 1
         assert msg[0]['op'] == 'stream-start'
 
-        bcomm = BatchedSend(interval=10, loop=self.loop)
+        bcomm = BatchedSend(interval='10ms', loop=self.loop)
         bcomm.start(comm)
         self.scheduler_comm = bcomm
 
@@ -816,10 +839,7 @@ class Client(Node):
         try:
             self._scheduler_identity = yield self.scheduler.identity()
         except EnvironmentError:
-            if self.status not in ('running', 'connecting'):
-                return
-            else:
-                raise
+            logger.debug("Not able to query scheduler for identity")
 
     def _heartbeat(self):
         if self.scheduler_comm:
@@ -879,7 +899,7 @@ class Client(Node):
                         msgs = yield self.scheduler_comm.comm.read()
                     except CommClosedError:
                         if self.status == 'running':
-                            logger.warning("Client report stream closed to scheduler")
+                            logger.info("Client report stream closed to scheduler")
                             logger.info("Reconnecting...")
                             self.status = 'connecting'
                             yield self._reconnect()
@@ -1001,7 +1021,7 @@ class Client(Node):
 
     _shutdown = _close
 
-    def close(self, timeout=10):
+    def close(self, timeout=no_default):
         """ Close this client
 
         Clients will also close automatically when your Python session ends
@@ -1013,6 +1033,8 @@ class Client(Node):
         --------
         Client.restart
         """
+        if timeout == no_default:
+            timeout = self._timeout * 2
         # XXX handling of self.status here is not thread-safe
         if self.status == 'closed':
             return
@@ -1479,7 +1501,9 @@ class Client(Node):
 
     @gen.coroutine
     def _scatter(self, data, workers=None, broadcast=False, direct=None,
-                 local_worker=None, timeout=3, hash=True):
+                 local_worker=None, timeout=no_default, hash=True):
+        if timeout == no_default:
+            timeout = self._timeout
         if isinstance(workers, six.string_types + (Number,)):
             workers = [workers]
         if isinstance(data, dict) and not all(isinstance(k, (bytes, unicode))
@@ -1591,7 +1615,7 @@ class Client(Node):
                 qout.put(future)
 
     def scatter(self, data, workers=None, broadcast=False, direct=None,
-                hash=True, maxsize=0, timeout=3, asynchronous=None):
+                hash=True, maxsize=0, timeout=no_default, asynchronous=None):
         """ Scatter data into distributed memory
 
         This moves data from the local client process into the workers of the
@@ -1657,6 +1681,8 @@ class Client(Node):
         --------
         Client.gather: Gather data back to local process
         """
+        if timeout == no_default:
+            timeout = self._timeout
         if isqueue(data) or isinstance(data, Iterator):
             logger.debug("Starting thread for streaming data")
             qout = pyQueue(maxsize=maxsize)
@@ -2006,7 +2032,8 @@ class Client(Node):
             return futures
 
     def get(self, dsk, keys, restrictions=None, loose_restrictions=None,
-            resources=None, sync=True, asynchronous=None, **kwargs):
+            resources=None, sync=True, asynchronous=None, direct=None,
+            **kwargs):
         """ Compute dask graph
 
         Parameters
@@ -2018,6 +2045,8 @@ class Client(Node):
             jobs can take place
         sync: bool (optional)
             Returns Futures if False or concrete values if True (default).
+        direct: bool
+            Gather results directly from workers
 
         Examples
         --------
@@ -2036,13 +2065,18 @@ class Client(Node):
         packed = pack_data(keys, futures)
         if sync:
             if getattr(thread_state, 'key', False):
-                secede()
+                try:
+                    secede()
+                    should_rejoin = True
+                except Exception:
+                    should_rejoin = False
             try:
-                results = self.gather(packed, asynchronous=asynchronous)
+                results = self.gather(packed, asynchronous=asynchronous,
+                                      direct=direct)
             finally:
                 for f in futures.values():
                     f.release()
-                if getattr(thread_state, 'key', False):
+                if getattr(thread_state, 'key', False) and should_rejoin:
                     rejoin()
             return results
         return packed
@@ -2119,9 +2153,9 @@ class Client(Node):
         workers: str, list, dict
             Which workers can run which parts of the computation
             If a string a list then the output collections will run on the listed
-                workers, but other sub-computations can run anywhere
+            workers, but other sub-computations can run anywhere
             If a dict then keys should be (tuples of) collections and values
-                should be addresses or lists.
+            should be addresses or lists.
         allow_other_workers: bool, list
             If True then all restrictions in workers= are considered loose
             If a list then only the keys for the listed collections are loose
@@ -2244,9 +2278,9 @@ class Client(Node):
         workers: str, list, dict
             Which workers can run which parts of the computation
             If a string a list then the output collections will run on the listed
-                workers, but other sub-computations can run anywhere
+            workers, but other sub-computations can run anywhere
             If a dict then keys should be (tuples of) collections and values
-                should be addresses or lists.
+            should be addresses or lists.
         allow_other_workers: bool, list
             If True then all restrictions in workers= are considered loose
             If a list then only the keys for the listed collections are loose
@@ -2347,7 +2381,9 @@ class Client(Node):
         return self.sync(self._upload_environment, name, zipfile)
 
     @gen.coroutine
-    def _restart(self, timeout=5):
+    def _restart(self, timeout=no_default):
+        if timeout == no_default:
+            timeout = self._timeout
         self._send_to_scheduler({'op': 'restart', 'timeout': timeout})
         self._restart_event = Event()
         try:
@@ -2774,8 +2810,8 @@ class Client(Node):
         system. The scheduler file can be used to instantiate a second Client
         using the same scheduler.
 
-        Parameter
-        ---------
+        Parameters
+        ----------
         scheduler_file: str
             Path to a write the scheduler file.
 
@@ -2799,8 +2835,8 @@ class Client(Node):
 
         See set_metadata for the full docstring with examples
 
-        Parameter
-        ---------
+        Parameters
+        ----------
         keys: key or list
             Key to access.  If a list then gets within a nested collection
         default: optional

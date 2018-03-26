@@ -29,7 +29,9 @@ import dask
 from dask import delayed
 from dask.context import _globals
 from distributed import (Worker, Nanny, fire_and_forget, config,
-                         get_client, secede, get_worker, Executor, profile)
+                         get_client, secede, get_worker, Executor, profile,
+                         TimeoutError)
+from distributed.config import set_config
 from distributed.comm import CommClosedError
 from distributed.client import (Client, Future, wait, as_completed, tokenize,
                                 _get_global_client, default_client,
@@ -1430,6 +1432,8 @@ def test_scatter_gather_sync(loop, direct, broadcast):
             results = c.gather(futures, direct=direct)
             assert results == [1, 2, 3]
 
+            delayed(inc)(1).compute(direct=direct)
+
 
 @gen_cluster(client=True)
 def test_gather_direct(c, s, a, b):
@@ -2810,9 +2814,10 @@ def test_client_num_fds(loop):
             for i in range(4):
                 with Client(s['address'], loop=loop):   # start more clients
                     pass
-            after = proc.num_fds()                  # measure
-
-        assert before == after
+            start = time()
+            while proc.num_fds() > before:
+                sleep(0.01)
+                assert time() < start + 4
 
 
 @gen_cluster()
@@ -4303,13 +4308,15 @@ def test_map_list_kwargs(c, s, a, b):
 
 @gen_cluster(client=True)
 def test_dont_clear_waiting_data(c, s, a, b):
-    [x] = yield c.scatter([1])
-    y = c.submit(slowinc, x, delay=0.2)
+    start = time()
+    x = yield c.scatter(1)
+    y = c.submit(slowinc, x, delay=0.5)
     while y.key not in s.tasks:
         yield gen.sleep(0.01)
-    [x] = yield c.scatter([1])
+    key = x.key
+    del x
     for i in range(5):
-        assert s.waiting_data[x.key]
+        assert s.waiting_data[key]
         yield gen.moment
 
 
@@ -4414,6 +4421,16 @@ def test_recreate_error_collection(c, s, a, b):
     function, args, kwargs = yield c._recreate_error_locally(df3)
     with pytest.raises(ValueError):
         function(*args, **kwargs)
+
+
+@gen_cluster(client=True)
+def test_recreate_error_array(c, s, a, b):
+    da = pytest.importorskip('dask.array')
+    pytest.importorskip('scipy')
+    z = (da.linalg.inv(da.zeros((10, 10), chunks=10)) + 1).sum()
+    zz = z.persist()
+    func, args, kwargs = yield c._recreate_error_locally(zz)
+    assert '0.,0.,0.' in str(args).replace(' ', '')  # args contain actual arrays
 
 
 def test_recreate_error_sync(loop):
@@ -5193,6 +5210,45 @@ def test_client_doesnt_close_given_loop(loop):
             assert c.submit(inc, 1).result() == 2
         with Client(s['address'], loop=loop) as c:
             assert c.submit(inc, 2).result() == 3
+
+
+@gen_cluster(client=True, ncores=[])
+def test_quiet_scheduler_loss(c, s):
+    c._periodic_callbacks['scheduler-info'].interval = 10
+    with captured_logger(logging.getLogger('distributed.client')) as logger:
+        yield s.close()
+        yield c._update_scheduler_info()
+    text = logger.getvalue()
+    assert "BrokenPipeError" not in text
+
+
+@pytest.mark.skipif('USER' not in os.environ, reason='no USER env variable')
+def test_diagnostics_link_env_variable(loop):
+    pytest.importorskip('bokeh')
+    from distributed.bokeh.scheduler import BokehScheduler
+    with cluster(scheduler_kwargs={'services': {('bokeh', 12355): BokehScheduler}}) as (s, [a, b]):
+        with Client(s['address'], loop=loop) as c:
+            config['diagnostics-link'] = 'http://foo-{USER}:{port}/status'
+            try:
+                text = c._repr_html_()
+                link = 'http://foo-' + os.environ['USER'] + ':12355/status'
+                assert link in text
+            finally:
+                del config['diagnostics-link']
+
+
+@gen_test()
+def test_client_timeout_2():
+    with set_config({'connect-timeout': '10ms'}):
+        start = time()
+        c = Client('127.0.0.1:3755', asynchronous=True)
+        with pytest.raises((TimeoutError, IOError)):
+            yield c
+        stop = time()
+
+        yield c.close()
+
+        assert stop - start < 1
 
 
 if sys.version_info >= (3, 5):

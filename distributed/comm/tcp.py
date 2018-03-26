@@ -13,13 +13,14 @@ except ImportError:
 
 import tornado
 from tornado import gen, netutil
-from tornado.iostream import StreamClosedError
+from tornado.iostream import StreamClosedError, IOStream
 from tornado.tcpclient import TCPClient
 from tornado.tcpserver import TCPServer
 
 from .. import config
-from ..compatibility import finalize
-from ..utils import (ensure_bytes, ensure_ip, get_ip, get_ipv6, nbytes)
+from ..compatibility import finalize, PY3
+from ..utils import (ensure_bytes, ensure_ip, get_ip, get_ipv6, nbytes,
+                     parse_timedelta, shutting_down)
 
 from .registry import Backend, backends
 from .addressing import parse_host_port, unparse_host_port
@@ -51,7 +52,8 @@ def set_tcp_timeout(stream):
     if stream.closed():
         return
 
-    timeout = int(config.get('tcp-timeout', 30))
+    timeout = config.get('tcp-timeout', 30)
+    timeout = int(parse_timedelta(timeout, default='seconds'))
 
     sock = stream.socket
 
@@ -131,6 +133,9 @@ class TCP(Comm):
     An established communication based on an underlying Tornado IOStream.
     """
     _iostream_allows_memoryview = tornado.version_info >= (4, 5)
+    # IOStream.read_into() currently proposed in
+    # https://github.com/tornadoweb/tornado/pull/2193
+    _iostream_has_read_into = hasattr(IOStream, "read_into")
 
     def __init__(self, stream, local_addr, peer_addr, deserialize=True):
         self._local_addr = local_addr
@@ -178,14 +183,21 @@ class TCP(Comm):
 
             frames = []
             for length in lengths:
-                if length:
-                    frame = yield stream.read_bytes(length)
+                if PY3 and self._iostream_has_read_into:
+                    frame = bytearray(length)
+                    if length:
+                        n = yield stream.read_into(frame)
+                        assert n == length, (n, length)
                 else:
-                    frame = b''
+                    if length:
+                        frame = yield stream.read_bytes(length)
+                    else:
+                        frame = b''
                 frames.append(frame)
         except StreamClosedError as e:
             self.stream = None
-            convert_stream_closed_error(self, e)
+            if not shutting_down():
+                convert_stream_closed_error(self, e)
 
         try:
             msg = yield from_frames(frames, deserialize=self.deserialize)

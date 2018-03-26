@@ -3002,7 +3002,7 @@ class Scheduler(ServerNode):
 
         prefix = ts.prefix
         unknowns = self.unknown_durations[prefix]
-        logging.getLogger(__name__).info('%s -- %s', prefix, unknowns)
+        logging.getLogger(__name__).critical('%s -- %s', prefix, unknowns)
         if unknowns:
             unknowns.remove(ts)
             if not unknowns:

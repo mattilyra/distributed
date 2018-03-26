@@ -2991,7 +2991,6 @@ class Scheduler(ServerNode):
             return default
 
     def check_task_duration(self, ts, default=5):
-
         prefix = ts.prefix
         unknowns = self.unknown_durations[prefix]
         ws = ts.processing_on

@@ -2987,25 +2987,16 @@ class Scheduler(ServerNode):
         try:
             return self.task_duration[prefix]
         except KeyError:
-            add_callback = ts not in self.unknown_durations[prefix] and ts.processing_on
             self.unknown_durations[prefix].add(ts)
-            if add_callback:
-                # add callback to check back in 5 seconds if the job is still in unknown durations
-                self.io_loop.call_later(5, self.check_task_duration, ts=ts)
-
             return default
 
     def check_task_duration(self, ts, default=5):
 
         prefix = ts.prefix
         unknowns = self.unknown_durations[prefix]
-        logging.getLogger(__name__).critical('%s -- %s', prefix, unknowns)
-
         ws = ts.processing_on
         if not ws:
             return
-
-
         if unknowns:
             unknowns.remove(ts)
             if not unknowns:
@@ -3272,6 +3263,10 @@ class Scheduler(ServerNode):
 
             duration = self.get_task_duration(ts)
             comm = self.get_comm_cost(ts, ws)
+
+            if ts in self.unknown_durations[ts.prefix]:
+                # add callback to check back in 5 seconds if the job is still in unknown durations
+                self.io_loop.call_later(5, self.check_task_duration, ts=ts)
 
             ws.processing[ts] = duration + comm
             ts.processing_on = ws

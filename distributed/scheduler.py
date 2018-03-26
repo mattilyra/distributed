@@ -2996,13 +2996,16 @@ class Scheduler(ServerNode):
             return default
 
     def check_task_duration(self, ts, default=5):
-        ws = ts.processing_on
-        if not ws:
-            return
 
         prefix = ts.prefix
         unknowns = self.unknown_durations[prefix]
         logging.getLogger(__name__).critical('%s -- %s', prefix, unknowns)
+
+        ws = ts.processing_on
+        if not ws:
+            return
+
+
         if unknowns:
             unknowns.remove(ts)
             if not unknowns:
